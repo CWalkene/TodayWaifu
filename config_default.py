@@ -5,6 +5,7 @@ from typing import Dict
 from gsuid_core.utils.plugins_config.models import (
     GSC,
     GsBoolConfig,
+    GsFloatConfig,
     GsStrConfig,
 )
 
@@ -33,5 +34,22 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
         '文字模板',
         '可用变量：{name} 角色名，{role_id} 数字 ID',
         '你今天的老婆是{name}',
+    ),
+    'DailyWifeEnableGroupMember': GsBoolConfig(
+        '启用群成员老婆',
+        '开启后，群聊触发今日老婆时有概率抽到本群已记录成员；关闭后只抽鸣潮角色',
+        False,
+    ),
+    'DailyWifeGroupMemberProbability': GsFloatConfig(
+        '群成员抽取概率',
+        '启用群成员老婆后生效，范围 0~1，例如 0.1 表示 10% 概率抽到群成员',
+        0.1,
+        0.0,
+        1.0,
+    ),
+    'DailyWifeMasterUnlimited': GsBoolConfig(
+        '主人无限抽老婆',
+        '开启后，GSCore 主人触发今日老婆或娶群友时不再按每日固定结果，可重复随机抽取',
+        True,
     ),
 }
