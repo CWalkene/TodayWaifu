@@ -237,6 +237,18 @@ def _user_key(ev: Event, user_id: str | int | None = None) -> str:
     return str(ev.user_id if user_id is None else user_id)
 
 
+def _user_display_name(ev: Event, user_id: str | int | None = None) -> str:
+    key = _user_key(ev, user_id)
+    if user_id is None or key == str(ev.user_id):
+        sender = getattr(ev, 'sender', {}) or {}
+        if isinstance(sender, dict):
+            for field in ('card', 'nickname'):
+                value = str(sender.get(field) or '').strip()
+                if value:
+                    return value
+    return key
+
+
 def _load_wife_data() -> dict[str, Any]:
     path = _wife_data_path()
     if not path.is_file():
@@ -270,6 +282,7 @@ def _record_to_dict(record: WifeRecord, ev: Event | None = None, user_id: str | 
         data.update(
             {
                 'user_id': _user_key(ev, user_id),
+                'display_name': _user_display_name(ev, user_id),
                 'group_id': str(ev.group_id or 'direct'),
                 'bot_id': str(ev.bot_id),
                 'day': _today_key(),
@@ -383,6 +396,37 @@ def _save_daily_wife_record(ev: Event, record: WifeRecord, user_id: str | int | 
     _save_wife_data(data)
 
 
+def _wife_list_text(ev: Event) -> str:
+    data = _load_wife_data()
+    context = _get_today_context(data, ev)
+    wives = context.get('wives', {})
+    if not isinstance(wives, dict) or not wives:
+        return '今天本群还没有人抽老婆。'
+
+    items: list[tuple[int, str, str]] = []
+    for user_id, raw_record in wives.items():
+        if not isinstance(raw_record, dict):
+            continue
+        record = _record_from_dict(raw_record)
+        if record is None:
+            continue
+        display_name = str(raw_record.get('display_name') or user_id).strip() or str(user_id)
+        updated_at = raw_record.get('updated_at')
+        try:
+            order = int(updated_at)
+        except (TypeError, ValueError):
+            order = 0
+        items.append((order, display_name, record.name))
+
+    if not items:
+        return '今天本群还没有可用的老婆记录。'
+
+    items.sort(key=lambda item: (item[0], item[1]))
+    lines = ['今日老婆列表：']
+    lines.extend(f'{index}.{display_name}今天的老婆是{wife_name}' for index, (_, display_name, wife_name) in enumerate(items, 1))
+    return '\n'.join(lines)
+
+
 async def _send_role_image(
     bot: Bot,
     role: RoleCandidate,
@@ -470,9 +514,18 @@ async def _send_rob_wife(bot: Bot, ev: Event):
     await _send_role_image(bot, role, target_record.image, text, robber_id)
 
 
+async def _send_wife_list(bot: Bot, ev: Event):
+    await bot.send(_wife_list_text(ev))
+
+
 @sv.on_fullmatch('今日老婆', block=True)
 async def daily_wife(bot: Bot, ev: Event):
     await _send_daily_wife(bot, ev)
+
+
+@sv.on_fullmatch(('老婆列表', '今日老婆列表'), block=True)
+async def daily_wife_list(bot: Bot, ev: Event):
+    await _send_wife_list(bot, ev)
 
 
 @sv.on_prefix(('抢老婆', '抢今日老婆'), block=True)
