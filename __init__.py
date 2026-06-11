@@ -19,6 +19,7 @@ from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.segment import MessageSegment
 from gsuid_core.sv import Plugins, SV
+from gsuid_core.utils.database.models import CoreUser
 
 from .daily_wife_config import DailyWifeConfig
 
@@ -237,16 +238,50 @@ def _user_key(ev: Event, user_id: str | int | None = None) -> str:
     return str(ev.user_id if user_id is None else user_id)
 
 
+def _valid_display_name(value: Any, user_id: str | int | None = None) -> str:
+    text = str(value or '').strip()
+    if text in {'', '1', 'None', 'none', 'NULL', 'null'}:
+        return ''
+    if user_id is not None and text == str(user_id):
+        return ''
+    return text
+
+
 def _user_display_name(ev: Event, user_id: str | int | None = None) -> str:
     key = _user_key(ev, user_id)
     if user_id is None or key == str(ev.user_id):
         sender = getattr(ev, 'sender', {}) or {}
         if isinstance(sender, dict):
-            for field in ('card', 'nickname'):
-                value = str(sender.get(field) or '').strip()
+            for field in ('card', 'nickname', 'name', 'username', 'user_name'):
+                value = _valid_display_name(sender.get(field), key)
                 if value:
                     return value
     return key
+
+
+async def _load_group_display_names(ev: Event) -> dict[str, str]:
+    if not ev.group_id:
+        return {}
+
+    try:
+        users = await CoreUser.get_group_all_user(str(ev.group_id))
+    except Exception as exc:
+        logger.warning(f'[gs_wuwa_daily_wife] 读取 GsCore 群成员缓存失败: {exc}')
+        return {}
+
+    preferred_bot_id = str(getattr(ev, 'real_bot_id', '') or ev.bot_id or '').strip()
+    exact: dict[str, str] = {}
+    fallback: dict[str, str] = {}
+    for user in users or []:
+        user_id = str(getattr(user, 'user_id', '') or '').strip()
+        if not user_id:
+            continue
+        name = _valid_display_name(getattr(user, 'user_name', ''), user_id)
+        if name:
+            fallback[user_id] = name
+            if preferred_bot_id and str(getattr(user, 'bot_id', '') or '').strip() == preferred_bot_id:
+                exact[user_id] = name
+    return exact or fallback
 
 
 def _load_wife_data() -> dict[str, Any]:
@@ -396,13 +431,15 @@ def _save_daily_wife_record(ev: Event, record: WifeRecord, user_id: str | int | 
     _save_wife_data(data)
 
 
-def _wife_list_text(ev: Event) -> str:
+async def _wife_list_text(ev: Event) -> str:
     data = _load_wife_data()
     context = _get_today_context(data, ev)
     wives = context.get('wives', {})
     if not isinstance(wives, dict) or not wives:
         return '今天本群还没有人抽老婆。'
 
+    group_display_names = await _load_group_display_names(ev)
+    data_changed = False
     items: list[tuple[int, str, str]] = []
     for user_id, raw_record in wives.items():
         if not isinstance(raw_record, dict):
@@ -410,7 +447,16 @@ def _wife_list_text(ev: Event) -> str:
         record = _record_from_dict(raw_record)
         if record is None:
             continue
-        display_name = str(raw_record.get('display_name') or user_id).strip() or str(user_id)
+        display_name = _valid_display_name(raw_record.get('display_name'), user_id)
+        if not display_name:
+            display_name = group_display_names.get(str(user_id), '')
+            if display_name:
+                raw_record['display_name'] = display_name
+                raw_record['display_name_source'] = 'coreuser'
+                raw_record['display_name_updated_at'] = int(time.time())
+                data_changed = True
+        if not display_name:
+            display_name = str(user_id)
         updated_at = raw_record.get('updated_at')
         try:
             order = int(updated_at)
@@ -420,6 +466,9 @@ def _wife_list_text(ev: Event) -> str:
 
     if not items:
         return '今天本群还没有可用的老婆记录。'
+
+    if data_changed:
+        _save_wife_data(data)
 
     items.sort(key=lambda item: (item[0], item[1]))
     lines = ['今日老婆列表：']
@@ -515,7 +564,7 @@ async def _send_rob_wife(bot: Bot, ev: Event):
 
 
 async def _send_wife_list(bot: Bot, ev: Event):
-    await bot.send(_wife_list_text(ev))
+    await bot.send(await _wife_list_text(ev))
 
 
 @sv.on_fullmatch('今日老婆', block=True)
