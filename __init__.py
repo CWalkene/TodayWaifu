@@ -345,8 +345,6 @@ def _is_master(ev: Event) -> bool:
 
 
 def _event_rng(ev: Event) -> random.Random:
-    if bool(_cfg('DailyWifeMasterUnlimited')) and _is_master(ev):
-        return random.Random()
     return _daily_rng(ev)
 
 
@@ -910,8 +908,8 @@ async def _send_daily_wife(bot: Bot, ev: Event, mode: str = 'wife', specified_na
     is_debug = _cfg_bool('DailyWifeDebugMode', False)
     is_debug_active = is_debug and is_master
 
-    # 老婆模式下，若今天的老婆已被抢走，且不处于无限抽或Debug模式，则不再补抽
-    if mode == 'wife' and not is_debug_active and not (bool(_cfg('DailyWifeMasterUnlimited')) and is_master):
+    # 老婆模式下，若今天的老婆已被抢走，且不处于 Debug 模式，则不再补抽
+    if mode == 'wife' and not is_debug_active:
         data = _load_wife_data()
         context = _get_today_context(data, ev)
         user_key = _user_key(ev)
@@ -950,21 +948,9 @@ async def _send_daily_wife(bot: Bot, ev: Event, mode: str = 'wife', specified_na
         if specified_name:
             return await bot.send(f'只有在 Debug 模式下主人才能指定{title}哦。')
 
-        # 普通逻辑或 MasterUnlimited 逻辑
-        if bool(_cfg('DailyWifeMasterUnlimited')) and is_master:
-            rng = random.Random()
-            if mode == 'wife':
-                record = await _roll_group_member_wife(ev, rng=rng)
-            
-            # 若未抽到群友，则回退到抽取角色
-            if record is None:
-                role = rng.choice(candidates)
-                image = rng.choice(role.images)
-                record = WifeRecord.from_role(role, image)
-        else:
-            record = await _ensure_daily_wife_record(ev, mode=mode)
-            if record is None:
-                return await bot.send(f'没有找到可用的{title}角色。')
+        record = await _ensure_daily_wife_record(ev, mode=mode)
+        if record is None:
+            return await bot.send(f'没有找到可用的{title}角色。')
 
         # 正常模式下必须保存记录
         _save_daily_wife_record(ev, record, mode=mode)
@@ -1054,7 +1040,7 @@ async def _send_wife_list(bot: Bot, ev: Event, mode: str = 'wife'):
     await bot.send(await _wife_list_text(ev, mode))
 
 
-@sv.on_prefix('今日老婆', block=True)
+@sv.on_prefix(('今日老婆', '娶婆娘'), block=True)
 async def daily_wife_prefix(bot: Bot, ev: Event):
     specified_name = str(ev.text or '').strip()
     if specified_name == '列表':
@@ -1062,7 +1048,7 @@ async def daily_wife_prefix(bot: Bot, ev: Event):
     await _send_daily_wife(bot, ev, mode='wife', specified_name=specified_name)
 
 
-@sv.on_fullmatch('今日老婆', block=True)
+@sv.on_fullmatch(('今日老婆', '娶婆娘'), block=True)
 async def daily_wife_full(bot: Bot, ev: Event):
     # 全匹配模式下，没有后缀参数，直接传入空字符串
     await _send_daily_wife(bot, ev, mode='wife', specified_name='')
@@ -1101,11 +1087,11 @@ async def group_member_wife(bot: Bot, ev: Event):
     await _send_group_member_wife(bot, ev)
 
 
-@sv.on_prefix(('抢老婆', '抢今日老婆'), block=True)
+@sv.on_prefix(('抢老婆', '抢今日老婆', '抢婆娘'), block=True)
 async def rob_wife(bot: Bot, ev: Event):
     await _send_rob_wife(bot, ev)
 
 
-@sv.on_fullmatch(('抢老婆', '抢今日老婆'), block=True)
+@sv.on_fullmatch(('抢老婆', '抢今日老婆', '抢婆娘'), block=True)
 async def rob_wife_at(bot: Bot, ev: Event):
     await _send_rob_wife(bot, ev)

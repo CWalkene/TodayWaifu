@@ -218,6 +218,12 @@ group_member_avatar_cache/{user_id}.jpg
 今日老婆
 ```
 
+也可以用别名：
+
+```text
+娶婆娘
+```
+
 从鸣潮女角色池里抽一个今日老婆。
 
 同一个用户在同一天、同一个群里结果固定。
@@ -310,6 +316,12 @@ DailyWifeRobEnabled
 抢今日老婆 @对方
 ```
 
+或别名：
+
+```text
+抢婆娘 @对方
+```
+
 规则：
 
 - 对方今天必须已经抽过 `今日老婆`；
@@ -365,7 +377,6 @@ Debug 模式下：
 | `DailyWifeMarryGroupMemberTextTemplate` | `你娶到的群友是{name}` | 娶群友文字模板。可用 `{name}`、`{user_id}`。 |
 | `DailyWifeHusbandEnabled` | 关闭 | 是否启用 `今日老公`。 |
 | `DailyHusbandTextTemplate` | `你今天的老公是{name}` | 今日老公文字模板。可用 `{name}`、`{role_id}`。 |
-| `DailyWifeMasterUnlimited` | 开启 | GSCore 主人是否不固定每日结果，可以重复随机抽。 |
 | `DailyWifeRobEnabled` | 开启 | 是否启用抢老婆。 |
 | `DailyWifeRobSuccessRate` | `0.5` | 抢老婆成功概率。`0.5` 是 50%。 |
 | `DailyWifeRobSuccessTemplate` | `抢老婆成功！你把对方今天的老婆{name}抢过来了！` | 抢老婆成功后的提示。可用 `{name}`、`{role_id}`、`{target}`。 |

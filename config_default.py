@@ -79,11 +79,6 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
         '今日老公的文字说明模板，可用变量：{name} 角色名，{role_id} 数字 ID',
         '你今天的老公是{name}',
     ),
-    'DailyWifeMasterUnlimited': GsBoolConfig(
-        '主人无限抽老婆',
-        '开启后，GSCore 主人触发今日老婆时不再按每日固定结果，可重复随机抽取',
-        True,
-    ),
     'DailyWifeRobEnabled': GsBoolConfig(
         '启用抢老婆',
         '关闭后抢老婆命令不再生效',
