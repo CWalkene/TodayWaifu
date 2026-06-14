@@ -3,5 +3,6 @@ __pycache__/
 *.pyo
 
 daily_wife_data.json
+data/
 group_member_avatar_cache/
 xwuid_gallery_accounts*.txt
