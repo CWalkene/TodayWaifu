@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / 'config.json'
 
 DailyWifeConfig = StringConfig(
-    'gs_wuwa_daily_wife',
+    'TodayWaifu',
     CONFIG_PATH,
     CONFIG_DEFAULT,
 )

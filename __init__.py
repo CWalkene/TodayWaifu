@@ -28,7 +28,7 @@ from gsuid_core.utils.database.models import CoreUser
 from .daily_wife_config import DailyWifeConfig
 
 Plugins(
-    name='gs_wuwa_daily_wife',
+    name='TodayWaifu',
     disable_force_prefix=True,
     allow_empty_prefix=True,
 )
@@ -207,7 +207,7 @@ def _resolve_role_map_path() -> Path | None:
 
 
 def _custom_upload_data_root() -> Path:
-    return get_res_path('gs_wuwa_daily_wife')
+    return get_res_path('TodayWaifu')
 
 
 def _custom_upload_role_map_path() -> Path:
