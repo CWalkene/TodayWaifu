@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -36,6 +37,7 @@ Plugins(
 sv = SV('鸣潮今日老婆')
 upload_sv = SV('鸣潮今日老婆上传', pm=1)
 BASE_DIR = Path(__file__).parent
+DEFAULT_GALLERY_API_URL = 'https://img.xlinxc.cn/api/xwuid/roles'
 CACHE_TTL_SECONDS = 300
 MEMBER_AVATAR_CACHE_SECONDS = 7 * 24 * 60 * 60
 LIST_FORWARD_THRESHOLD = 10
@@ -114,8 +116,8 @@ EXCLUDED_ROLE_NAMES = {
     '陆·赫斯',
 }
 EXCLUDED_ROLE_KEYWORDS = ('漂泊者',)
-# 本地角色候选缓存
-CANDIDATE_CACHE: tuple[float, tuple['RoleCandidate', ...]] | None = None
+# 按数据源分别缓存候选，避免切换数据源后误用旧缓存
+CANDIDATE_CACHE: dict[str, tuple[float, tuple['RoleCandidate', ...]]] = {}
 CUSTOM_ROLE_DELETE_PENDING: dict[str, dict[str, Any]] = {}
 
 
@@ -181,6 +183,11 @@ def _cfg_probability(key: str, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         value = default
     return max(0.0, min(1.0, value))
+
+
+def _image_source() -> str:
+    value = str(_cfg('DailyWifeImageSource') or 'local').strip().lower()
+    return 'gallery' if value == 'gallery' else 'local'
 
 
 def _configured_path(key: str) -> Path | None:
@@ -303,8 +310,7 @@ def _role_images(role_dir: Path) -> tuple[str, ...]:
 
 
 def _invalidate_candidate_cache() -> None:
-    global CANDIDATE_CACHE
-    CANDIDATE_CACHE = None
+    CANDIDATE_CACHE.clear()
 
 
 def _role_ids_by_name(role_map: dict[str, str], role_name: str) -> tuple[str, ...]:
@@ -699,25 +705,155 @@ def _is_excluded_role(name: str) -> bool:
 def _husband_enabled() -> bool:
     return _cfg_bool('DailyWifeHusbandEnabled', False)
 
+
+def _gallery_mode_enabled() -> bool:
+    return _image_source() == 'gallery'
+
+
+def _husband_unavailable_message() -> str:
+    if _gallery_mode_enabled():
+        return '图库模式下禁止使用今日老公'
+    return '今日老公功能当前已关闭。'
+
+
+def _husband_available() -> bool:
+    return _husband_enabled() and not _gallery_mode_enabled()
+
+
 def _filter_by_mode(candidates: tuple['RoleCandidate', ...], mode: str) -> tuple['RoleCandidate', ...]:
     if mode == 'husband':
         return tuple(role for role in candidates if _is_male_role(role.name))
     return tuple(role for role in candidates if not _is_male_role(role.name))
 
 
+def _gallery_api_url() -> str:
+    return str(_cfg('DailyWifeGalleryApiUrl') or DEFAULT_GALLERY_API_URL).strip()
+
+
+def _gallery_auth_header() -> str | None:
+    username = str(_cfg('DailyWifeGalleryUsername') or '').strip()
+    password = str(_cfg('DailyWifeGalleryPassword') or '').strip()
+    if not username or not password:
+        return None
+    token = base64.b64encode(f'{username}:{password}'.encode('utf-8')).decode('ascii')
+    return f'Basic {token}'
+
+
+def _request_headers() -> dict[str, str]:
+    headers = {'User-Agent': 'TodayWaifu/1.0'}
+    auth = _gallery_auth_header()
+    if auth:
+        headers['Authorization'] = auth
+    return headers
+
+
+def _http_get(url: str, *, timeout: int = 15) -> bytes:
+    request = Request(url, headers=_request_headers())
+    with urlopen(request, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _fetch_gallery_payload_sync() -> dict[str, Any]:
+    api_url = _gallery_api_url()
+    if not api_url:
+        raise RuntimeError('未配置图库接口地址。')
+    try:
+        body = _http_get(api_url, timeout=15)
+    except HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError('图库账号或密码不正确，接口返回 401。') from exc
+        raise RuntimeError(f'请求图库接口失败，HTTP {exc.code}。') from exc
+    except URLError as exc:
+        raise RuntimeError(f'请求图库接口失败：{exc.reason}') from exc
+    except TimeoutError as exc:
+        raise RuntimeError('请求图库接口超时。') from exc
+
+    try:
+        payload = json.loads(body.decode('utf-8'))
+    except Exception as exc:
+        raise RuntimeError('图库接口返回内容不是有效 JSON。') from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError('图库接口返回格式不正确。')
+    return payload
+
+
+def _parse_role_candidates(payload: dict[str, Any]) -> tuple[RoleCandidate, ...]:
+    roles_data = payload.get('roles')
+    if not isinstance(roles_data, list):
+        return ()
+
+    candidates: list[RoleCandidate] = []
+    for item in roles_data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or '').strip()
+        if not name or _is_excluded_role(name):
+            continue
+
+        role_ids_data = item.get('role_ids') or []
+        role_ids = tuple(str(role_id) for role_id in role_ids_data if str(role_id).strip())
+
+        images: list[str] = []
+        for image_item in item.get('images') or []:
+            if isinstance(image_item, dict):
+                url = str(image_item.get('url') or '').strip()
+            else:
+                url = str(image_item or '').strip()
+            if url.startswith(('http://', 'https://')):
+                images.append(url)
+        if images:
+            candidates.append(RoleCandidate(name=name, role_ids=role_ids, images=tuple(images)))
+
+    logger.info(f'{LOG_PREFIX} 成功从图库解析候选角色 {len(candidates)} 名')
+    return tuple(sorted(candidates, key=lambda role: role.name))
+
+
+def _download_image_sync(url: str) -> bytes:
+    try:
+        return _http_get(url, timeout=20)
+    except HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError('图库账号或密码不正确，图片返回 401。') from exc
+        raise RuntimeError(f'下载图片失败，HTTP {exc.code}。') from exc
+    except URLError as exc:
+        raise RuntimeError(f'下载图片失败：{exc.reason}') from exc
+    except TimeoutError as exc:
+        raise RuntimeError('下载图片超时。') from exc
+
+
+async def _download_image(url: str) -> bytes:
+    return await asyncio.to_thread(_download_image_sync, url)
+
+
 async def _load_candidates() -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
-    global CANDIDATE_CACHE
-
+    source = _image_source()
     now = time.time()
-    if CANDIDATE_CACHE and now - CANDIDATE_CACHE[0] < CACHE_TTL_SECONDS:
-        logger.debug(f'{LOG_PREFIX} 使用缓存的候选角色列表')
-        return CANDIDATE_CACHE[1], None
+    cached = CANDIDATE_CACHE.get(source)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        logger.debug(f'{LOG_PREFIX} 使用缓存的候选角色列表: {source}')
+        return cached[1], None
 
-    candidates, error = await asyncio.to_thread(_load_local_candidates)
-    if error or not candidates:
-        return None, error
+    if source == 'local':
+        candidates, error = await asyncio.to_thread(_load_local_candidates)
+        if error or not candidates:
+            return None, error
+        CANDIDATE_CACHE[source] = (now, candidates)
+        return candidates, None
 
-    CANDIDATE_CACHE = (now, candidates)
+    try:
+        payload = await asyncio.to_thread(_fetch_gallery_payload_sync)
+        candidates = _parse_role_candidates(payload)
+    except RuntimeError as exc:
+        logger.warning(f'{LOG_PREFIX} 读取图库接口失败: {exc}')
+        return None, str(exc)
+    except Exception as exc:
+        logger.warning(f'{LOG_PREFIX} 读取图库接口异常: {exc}')
+        return None, '读取图库接口失败。'
+
+    if not candidates:
+        return None, '图库接口里没有找到可用的角色立绘。'
+
+    CANDIDATE_CACHE[source] = (now, candidates)
     return candidates, None
 
 
@@ -1277,11 +1413,19 @@ async def _send_role_image(
     text: str | None = None,
     user_id: str | int | None = None,
 ) -> None:
-    if not Path(image_url).is_file():
-        logger.warning(f'{LOG_PREFIX} 本地图片不存在: {image_url}')
-        await _send_prefixed(bot,'本地图片文件不存在，请检查 custom_role_pile 目录。')
-        return
-    image: Any = Path(image_url)
+    if image_url.startswith(('http://', 'https://')):
+        try:
+            image: Any = await _download_image(image_url)
+        except RuntimeError as exc:
+            logger.warning(f'{LOG_PREFIX} 下载图库图片失败: {exc}')
+            await _send_prefixed(bot, str(exc))
+            return
+    else:
+        if not Path(image_url).is_file():
+            logger.warning(f'{LOG_PREFIX} 本地图片不存在: {image_url}')
+            await _send_prefixed(bot,'本地图片文件不存在，请检查 custom_role_pile 目录。')
+            return
+        image = Path(image_url)
 
     messages: list[Any] = []
     if user_id is not None and bool(_cfg('DailyWifeAtUser')):
@@ -1328,11 +1472,16 @@ async def _send_record_image(
     user_id: str | int | None = None,
 ) -> None:
     text = _record_text(record, mode) if bool(_cfg('DailyWifeSendText')) else None
-    hint = '本地群友头像文件不存在，请稍后重试。' if record.record_type == 'member' else '本地图片文件不存在，请检查 custom_role_pile 目录。'
-    await _send_local_image(bot, record.image, hint, text, user_id)
+    if record.record_type == 'member':
+        await _send_local_image(bot, record.image, '本地群友头像文件不存在，请稍后重试。', text, user_id)
+        return
+    await _send_role_image(bot, record.to_role(), record.image, text, user_id)
 
 
 async def _send_daily_wife(bot: Bot, ev: Event, mode: str = 'wife', specified_name: str = ''):
+    if mode == 'husband' and _gallery_mode_enabled():
+        return await _send_prefixed(bot, _husband_unavailable_message())
+
     title = '老公' if mode == 'husband' else '老婆'
     logger.info(f'{LOG_PREFIX} 用户 {ev.user_id} 在群 {ev.group_id or "direct"} 请求 {title} (指定: {specified_name or "无"})')
     
@@ -1661,23 +1810,23 @@ async def daily_wife_list(bot: Bot, ev: Event):
 
 @sv.on_prefix('今日老公', block=True)
 async def daily_husband_prefix(bot: Bot, ev: Event):
-    if not _husband_enabled():
-        return await _send_prefixed(bot,'今日老公功能当前已关闭。')
+    if not _husband_available():
+        return await _send_prefixed(bot, _husband_unavailable_message())
     specified_name = str(ev.text or '').strip()
     await _send_daily_wife(bot, ev, mode='husband', specified_name=specified_name)
 
 
 @sv.on_fullmatch('今日老公', block=True)
 async def daily_husband_full(bot: Bot, ev: Event):
-    if not _husband_enabled():
-        return await _send_prefixed(bot,'今日老公功能当前已关闭。')
+    if not _husband_available():
+        return await _send_prefixed(bot, _husband_unavailable_message())
     await _send_daily_wife(bot, ev, mode='husband', specified_name='')
 
 
 @sv.on_fullmatch(('老公列表', '今日老公列表'), block=True)
 async def daily_husband_list(bot: Bot, ev: Event):
-    if not _husband_enabled():
-        return await _send_prefixed(bot,'今日老公功能当前已关闭。')
+    if not _husband_available():
+        return await _send_prefixed(bot, _husband_unavailable_message())
     await _send_wife_list(bot, ev, mode='husband')
 
 

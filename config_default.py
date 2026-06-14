@@ -9,14 +9,34 @@ from gsuid_core.utils.plugins_config.models import (
 )
 
 CONFIG_DEFAULT: Dict[str, GSC] = {
+    'DailyWifeImageSource': GsStrConfig(
+        '图片数据源',
+        '填 gallery 使用图库接口；填 local 使用本地图片目录读取',
+        'local',
+    ),
     'DailyWifeCustomRolePilePath': GsStrConfig(
         '本地角色图片目录',
-        '留空时自动查找 gsuid_core/data/XutheringWavesUID/custom_role_pile；也可以手动填写绝对路径',
+        '图片数据源为 local 时生效。留空时自动查找 gsuid_core/data/XutheringWavesUID/custom_role_pile；也可以手动填写绝对路径',
         '',
     ),
     'DailyWifeRoleMapPath': GsStrConfig(
         '本地角色 ID 对照表路径',
-        '留空时优先使用插件内置 role_id_map.txt；也可以手动填写自己的对照表路径',
+        '图片数据源为 local 时生效。留空时优先使用插件内置 role_id_map.txt；也可以手动填写自己的对照表路径',
+        '',
+    ),
+    'DailyWifeGalleryApiUrl': GsStrConfig(
+        '图库接口地址',
+        'XWUID 图库角色立绘接口地址，默认使用 https://img.xlinxc.cn/api/xwuid/roles',
+        'https://img.xlinxc.cn/api/xwuid/roles',
+    ),
+    'DailyWifeGalleryUsername': GsStrConfig(
+        '图库账号',
+        '访问 XWUID 图库接口和图片所需的账号',
+        '',
+    ),
+    'DailyWifeGalleryPassword': GsStrConfig(
+        '图库密码',
+        '访问 XWUID 图库接口和图片所需的密码',
         '',
     ),
     'DailyWifeSendText': GsBoolConfig(
