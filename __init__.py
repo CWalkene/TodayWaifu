@@ -1075,9 +1075,7 @@ async def _send_wife_list(bot: Bot, ev: Event, mode: str = 'wife'):
     logger.info(f'{LOG_PREFIX} 用户 {ev.user_id} 在群 {ev.group_id} 请求了 {mode} 列表')
     title_text, items = await _wife_list_items(ev, mode)
     if len(items) > LIST_FORWARD_THRESHOLD:
-        nodes = [title_text]
-        nodes.extend(f'{index}. {display_name} → {wife_name}' for index, (_, display_name, wife_name) in enumerate(items, 1))
-        await bot.send(MessageSegment.node(nodes))
+        await bot.send(MessageSegment.node([_wife_list_text_from_items(title_text, items)]))
         return
     await bot.send(_wife_list_text_from_items(title_text, items))
 
