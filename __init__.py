@@ -94,6 +94,8 @@ def _prefix_outgoing_message(message: Any) -> Any:
 
 
 async def _send_prefixed(bot: Bot, message: Any, *args: Any, **kwargs: Any) -> Any:
+    if not _cfg_bool('DailyWifeReplyPrefixEnabled', True):
+        return await bot.send(message, *args, **kwargs)
     return await bot.send(_prefix_outgoing_message(message), *args, **kwargs)
 
 # 本地图片读取相关常量
