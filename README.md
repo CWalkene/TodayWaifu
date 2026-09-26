@@ -1,32 +1,31 @@
 <div align="center">
 
-<img src="./ICON.png" width="160" alt="TodayWaifu ICON">
+<img src="./ICON.png" width="140" alt="TodayWaifu">
 
 # TodayWaifu
 
 _基于 [早柚核心（GsCore）](https://github.com/Genshin-bots/gsuid_core) 的多游戏「今日老婆」娱乐插件_
 
-[![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![GsCore](https://img.shields.io/badge/GsCore-%E6%97%A9%E6%9F%9A%E6%A0%B8%E5%BF%83-8f5db7)](https://github.com/Genshin-bots/gsuid_core)
-[![Python](https://img.shields.io/badge/Python-%E2%89%A53.11-3776ab)](pyproject.toml)
+<a href="https://github.com/MimoKit/TodayWaifu/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/MimoKit/TodayWaifu?style=flat&logo=github&color=8f5db7&label=Stars"></a>
+<a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MimoKit/TodayWaifu?color=blue&label=License"></a>
+<img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776ab?logo=python&logoColor=white">
+<a href="https://github.com/Genshin-bots/gsuid_core"><img alt="GsCore" src="https://img.shields.io/badge/GsCore-%E6%97%A9%E6%9F%9A%E6%A0%B8%E5%BF%83-76bad9"></a>
 
-每天零点一过，全群一起抽今日老婆 —— 还能抢、能送、能娶群友。
+[交流 Q 群 (798949533)](https://qm.qq.com/q/pJVt8HNwrg) · [问题反馈](https://github.com/MimoKit/TodayWaifu/issues)
 
 <a href="https://count.getloli.com/"><img src="https://count.getloli.com/get/@TodayWaifu?theme=moebooru" alt="TodayWaifu 访问计数"></a>
 
-[交流 Q 群 (798949533)](https://qm.qq.com/q/pJVt8HNwrg) | [问题反馈](https://github.com/MimoKit/TodayWaifu/issues)
-
 </div>
 
-TodayWaifu 为 GsCore 提供群娱乐互动玩法：鸣潮、异环、战双、萝莉、正太各玩各的，当天结果全天固定，可抢、可送、可离婚。安装后发送 `今日老婆帮助` 查看全部玩法。
+TodayWaifu 为 GsCore 提供群娱乐互动玩法：鸣潮、异环、战双、萝莉、正太各玩各的，当天结果全天固定，可抢、可送、可娶群友、可离婚。安装后发送 `今日老婆帮助`，一图看懂全部玩法。
 
-## 特性
+## 功能
 
-- **多游戏同抽** —— 各游戏独立开抽，互不干扰
-- **全天固定** —— 每天一抽，当日结果全员一致
-- **群互动** —— 抢老婆、送老婆、娶群友、离婚
-- **图源灵活** —— 每个功能可独立选择本地图片或远程图库
-- **出图不卡** —— 图片走独立投递队列，命令秒回
+1. **多游戏同抽** —— 各游戏独立开抽，互不干扰
+2. **全天固定** —— 每天一抽，当日结果全员一致
+3. **群互动** —— 抢老婆、送老婆、娶群友、离婚
+4. **图源灵活** —— 每个功能可独立选择本地图片或远程图库
+5. **出图不卡** —— 图片走独立投递队列，命令秒回
 
 ## 快速开始
 
@@ -65,11 +64,11 @@ git clone https://github.com/MimoKit/TodayWaifu
 > [!WARNING]
 > 远程图库会拉取线上图片，部分内容可能存在风控风险，请自行评估，风险由部署者承担。
 
-## 环境要求
+## 环境
 
 - [GsCore](https://github.com/Genshin-bots/gsuid_core) 最新版，Python `>= 3.11`
 
-## 开源协议
+## 协议与致谢
 
 [GPLv3](LICENSE)，仅供学习交流，严禁商用。感谢 [An](https://github.com/An-Sun110) 提供图库服务器支持、[CWalkene](https://github.com/CWalkene) 的修改建议。
 
