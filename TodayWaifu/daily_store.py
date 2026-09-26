@@ -95,10 +95,8 @@ async def _flush_write_batch(batch: _WriteBatch) -> None:
         for (day, bot_id, group_id, bucket, user_key), value in batch.rows.items()
     ]
     deletes = list(batch.deletes)
-    if deletes:
-        await DailyWifeRecord.delete_rows(deletes)
-    if rows:
-        await DailyWifeRecord.upsert_rows(rows)
+    if deletes or rows:
+        await DailyWifeRecord.apply_rows(rows, deletes)
 
 
 async def flush_pending_writes() -> None:

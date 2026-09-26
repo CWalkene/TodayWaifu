@@ -291,21 +291,12 @@ class DailyWifeRecord(BaseModel, table=True):
         )
 
     @classmethod
-    @with_session
-    async def upsert_rows(
+    async def _upsert_rows(
         cls,
         session: AsyncSession,
         rows: list[tuple[str, str, str, str, str, RoleRecordValue | bool | None]],
     ) -> None:
-        """把**多个上下文**的记录合并成一条多值 upsert。
-
-        GsCore 默认用 SQLite，所有写都要排一个进程级单写者闸门
-        （`utils/database/write_gate.py`），实测闸门吞吐只有约 250 写/秒。
-        零点高峰每个用户一次抽签就是一次写，逐条提交会把闸门压满。
-        这里让同一瞬间到达的写入共用一次事务，把闸门压力按合并倍数摊薄。
-
-        rows 的每项是 `(day, bot_id, group_id, bucket, user_key, value)`。
-        """
+        """在调用方提供的 session 中执行多上下文 upsert，不负责提交事务。"""
         values = []
         for day, bot_id, group_id, bucket, user_key, value in rows:
             row = cls._row_from_value(day, bot_id, group_id, bucket, str(user_key), value)
@@ -339,13 +330,12 @@ class DailyWifeRecord(BaseModel, table=True):
         )
 
     @classmethod
-    @with_session
-    async def delete_rows(
+    async def _delete_rows(
         cls,
         session: AsyncSession,
         rows: list[tuple[str, str, str, str, str]],
     ) -> None:
-        """批量删除多个上下文的记录（与 `upsert_rows` 同一批事务使用）。"""
+        """在调用方提供的 session 中执行删除，不负责提交事务。"""
         for day, bot_id, group_id, bucket, user_key in rows:
             await session.execute(
                 delete(cls)
@@ -355,6 +345,38 @@ class DailyWifeRecord(BaseModel, table=True):
                 .where(cls.bucket == bucket)
                 .where(cls.user_id == str(user_key))
             )
+
+    @classmethod
+    @with_session
+    async def upsert_rows(
+        cls,
+        session: AsyncSession,
+        rows: list[tuple[str, str, str, str, str, RoleRecordValue | bool | None]],
+    ) -> None:
+        """把多个上下文的记录合并成一次独立事务的多值 upsert。"""
+        await cls._upsert_rows(session, rows)
+
+    @classmethod
+    @with_session
+    async def delete_rows(
+        cls,
+        session: AsyncSession,
+        rows: list[tuple[str, str, str, str, str]],
+    ) -> None:
+        """批量删除多个上下文的记录，使用一次独立事务。"""
+        await cls._delete_rows(session, rows)
+
+    @classmethod
+    @with_session
+    async def apply_rows(
+        cls,
+        session: AsyncSession,
+        rows: list[tuple[str, str, str, str, str, RoleRecordValue | bool | None]],
+        deletes: list[tuple[str, str, str, str, str]],
+    ) -> None:
+        """原子应用一批删除和 upsert，共用同一个事务。"""
+        await cls._delete_rows(session, deletes)
+        await cls._upsert_rows(session, rows)
 
     @classmethod
     @with_session

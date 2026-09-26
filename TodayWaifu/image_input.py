@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import binascii
+from io import BytesIO
 from typing import Protocol, runtime_checkable
 from pathlib import Path
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from PIL import Image, UnidentifiedImageError
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
@@ -55,29 +58,70 @@ def image_suffix_from_source(source: str) -> str:
     return suffix if suffix in IMAGE_EXTENSIONS else ""
 
 
+# Bound decompressed work as well as transport bytes, including animated images.
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_IMAGE_FRAMES = 100
+_IMAGE_FORMAT_SUFFIXES = {
+    "JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
+    "GIF": ".gif", "BMP": ".bmp",
+}
+
+
 def detect_image_suffix(data: bytes, source: str) -> str:
-    if data.startswith(b"\xff\xd8\xff"):
-        return ".jpg"
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return ".png"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return ".gif"
-    if data.startswith(b"BM"):
-        return ".bmp"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return ".webp"
-    return image_suffix_from_source(source)
+    """Validate actual image contents; a source filename is never proof of type."""
+    try:
+        with Image.open(BytesIO(data)) as image:
+            suffix = _IMAGE_FORMAT_SUFFIXES.get(image.format or "", "")
+            if not suffix or image.width * image.height > MAX_IMAGE_PIXELS:
+                return ""
+            image.verify()
+        # verify() alone does not decode JPEG pixels (and consumes PNG streams).
+        with Image.open(BytesIO(data)) as image:
+            pixels = 0
+            for frame in range(MAX_IMAGE_FRAMES):
+                image.seek(frame)
+                pixels += image.width * image.height
+                if pixels > MAX_IMAGE_PIXELS:
+                    return ""
+                image.load()
+                try:
+                    image.seek(frame + 1)
+                except EOFError:
+                    return suffix
+            return ""
+    except (OSError, ValueError, SyntaxError, UnidentifiedImageError, Image.DecompressionBombError):
+        return ""
 
 
 def read_image_bytes(source: str, max_bytes: int) -> tuple[bytes, str] | None:
     text = str(source or "").strip()
-    if not text:
+    if not text or max_bytes <= 0:
         return None
     try:
-        if text.startswith("data:image/") and "," in text:
-            data = base64.b64decode(text.split(",", 1)[1], validate=False)
-        elif text.startswith("base64://"):
-            data = base64.b64decode(text[9:], validate=False)
+        if text.startswith("data:image/") or text.startswith("base64://"):
+            if text.startswith("data:image/"):
+                header, separator, encoded = text.partition(",")
+                if not separator or not header.endswith(";base64"):
+                    return None
+            else:
+                encoded = text[9:]
+            # Reject before decoding (which allocates the entire decoded buffer).
+            # A base64 quartet can represent up to three bytes; account for
+            # padding as well so payloads just over max_bytes never reach the
+            # decoder.
+            encoded_length = len(encoded)
+            if encoded_length == 0 or encoded_length % 4:
+                return None
+            padding = len(encoded) - len(encoded.rstrip("="))
+            decoded_length = (encoded_length // 4) * 3 - padding
+            if (
+                padding > 2
+                or decoded_length < 0
+                or decoded_length > max_bytes
+                or encoded_length > 4 * ((max_bytes + 2) // 3)
+            ):
+                return None
+            data = base64.b64decode(encoded, validate=True)
         else:
             if text.startswith("link://"):
                 text = text[7:]

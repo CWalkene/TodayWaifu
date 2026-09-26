@@ -1,0 +1,66 @@
+name: 问题反馈
+description: 请提供完整环境、场景、日志和现象，方便维护者快速排查。
+title: "[问题] "
+labels:
+  - needs-triage
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        遇到问题请不要只发送“插件报错了/用不了”。没有日志和上下文无法隔空排查。
+        请一次性提供环境、场景、完整日志和现象。该表单提交后会自动添加 `bug` 与 `needs-triage` 标签。
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境版本
+      description: 请填写 Python、GsCore、宿主机器人/适配器和 TodayWaifu 版本。
+      placeholder: |
+        Python 3.11 / GsCore 版本 / NoneBot2 + OneBot V11 / TodayWaifu 最新版
+    validations:
+      required: true
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 触发场景
+      description: 请填写具体指令、私聊或群聊，以及偶发还是每次必现。
+      placeholder: |
+        群聊发送“/今日老婆”无响应，每次必现
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 完整报错日志
+      description: 请粘贴终端中带 Traceback 的完整报错文本或清晰截图，不要只截最后一行，也不要拍反光屏幕。功能建议可填写“无报错”。
+      render: shell
+      placeholder: |
+        [ERROR] ...
+        Traceback (most recent call last):
+          ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 现象描述
+      description: 请说明预期表现和实际表现。
+      placeholder: |
+        预期：返回今日老婆图片
+        实际：没有任何反应 / 输出了异常内容
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issue，确认不是重复问题。
+          required: true
+        - label: 我已提供完整日志；若是功能建议，已填写“无报错”。
+          required: true

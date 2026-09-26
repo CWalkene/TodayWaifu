@@ -126,6 +126,52 @@ class DailyWifeRecordDbTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_apply_rows_rolls_back_delete_when_upsert_fails(self) -> None:
+        models = self.models
+
+        async def run() -> None:
+            seed_key = ("2026-08-14", "onebot", "3001", "wives", "u1")
+            seed_value = {"name": "保留", "image": "keep.png", "updated_at": 1}
+            await models.DailyWifeRecord.upsert_rows(
+                [(*seed_key, seed_value)]
+            )
+
+            original_upsert = models.DailyWifeRecord.__dict__["_upsert_rows"]
+
+            async def fail_upsert(cls, session, rows):
+                raise RuntimeError("injected upsert failure")
+
+            models.DailyWifeRecord._upsert_rows = classmethod(fail_upsert)
+            try:
+                with self.assertRaises(RuntimeError):
+                    await models.DailyWifeRecord.apply_rows(
+                        [
+                            (
+                                "2026-08-14",
+                                "onebot",
+                                "3001",
+                                "wives",
+                                "u2",
+                                {"name": "新记录", "updated_at": 2},
+                            )
+                        ],
+                        [seed_key],
+                    )
+            finally:
+                models.DailyWifeRecord._upsert_rows = original_upsert
+
+            self.assertEqual(
+                await models.DailyWifeRecord.get_record(*seed_key),
+                seed_value,
+            )
+            self.assertIsNone(
+                await models.DailyWifeRecord.get_record(
+                    "2026-08-14", "onebot", "3001", "wives", "u2"
+                )
+            )
+
+        asyncio.run(run())
+
     def test_import_legacy_keeps_only_recent_two_days(self) -> None:
         models = self.models
 

@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from gsuid_core.sv import SV, Plugins
+from gsuid_core.sv import SV
 from gsuid_core.bot import Bot
 from gsuid_core.config import core_config
 from gsuid_core.logger import logger
@@ -222,12 +222,6 @@ from .circuit_breaker import CircuitBreaker
 from .daily_repository import ContextKey, ContextRegistry
 from ..daily_wife_config import DailyWifeConfig
 
-Plugins(
-    name='TodayWaifu',
-    disable_force_prefix=True,
-    allow_empty_prefix=True,
-)
-
 help_sv = SV('今日老婆-帮助', priority=0)
 custom_role_sv = SV('今日老婆-自定义老婆', pm=1, priority=2)
 assign_wife_sv = SV('今日老婆-分配老婆', priority=2)
@@ -261,7 +255,7 @@ __all__ = [
     'HTTPError', 'IMAGE_EXTENSIONS', 'LIST_FORWARD_THRESHOLD', 'LOG_PREFIX',
     'LOLI_DOWNLOAD_LOG_PREFIX', 'LOLI_IMAGE_DIR_NAME', 'LOLI_MOBILE_UA',
     'LOLICONAPP_API_URL', 'LOLICONAPP_TAGS',
-    'MemberCandidate', 'Message', 'MessageSegment', 'Path', 'Plugins',
+    'MemberCandidate', 'Message', 'MessageSegment', 'Path',
     'ROLE_MAP_RE', 'Request', 'RoleCandidate', 'RoleRecordValue', 'SV',
     'PendingCustomRoleDelete', 'PendingGift', 'GalleryPayload',
     'NTE_DETAIL_CDN_BASE', 'ROLE_MAP_JSON_PATH', 'UPLOAD_IMAGE_MAX_BYTES', 'URLError', 'WifeRecord',

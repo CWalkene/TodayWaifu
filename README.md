@@ -1,4 +1,4 @@
-﻿# TodayWaifu
+# TodayWaifu
 
 <p align="center">
   <a href="https://github.com/MimoKit/TodayWaifu"><img src="./ICON.png" width="160" alt="TodayWaifu ICON"></a>
@@ -52,14 +52,21 @@ git clone https://github.com/MimoKit/TodayWaifu
 
 ## 丨数据源与图片配置
 
-插件支持多种图片来源模式，可在 **GsCore 网页控制台** 灵活配置：
+在 **GsCore 网页控制台** 配置，图片来源按功能独立选择：
 
-- **`local`（本地模式，默认）**：优先读取本地 `XutheringWavesUID`、`NTEUID` 等插件的角色图片。
-- **`gallery`（图库模式）**：自动调用远程 API 获取图片，无需手动配置本地图片资源。
+| 配置项 | 作用范围 | 默认 |
+| --- | --- | --- |
+| `DailyWifeImageSource` | 今日老婆 / 今日老公 | `local` |
+| `DailyWifeNteImageSource` | 今日异环老婆 | `gallery` |
+| `DailyWifePgrImageSource` | 今日战双老婆 | `gallery` |
+| `DailyLoliImageSource` | 今日萝莉 | `gallery` |
 
-图库接口启用令牌鉴权后，需在控制台填写 **图库访问令牌**（`DailyWifeGalleryToken`）才能正常取图。
-令牌请进 QQ 交流群 [798949533](https://qm.qq.com/q/pJVt8HNwrg) 获取；留空则请求不携带令牌，
-适用于未启用鉴权的部署。
+- **`local`**：只读取本地图库，不请求远程接口；本地没有图片的角色会被跳过。
+- **`gallery`**：使用远程图库接口，接口不可用时按功能回退本地资源。
+
+各功能默认值与升级前行为一致。普通老婆、今日老公和今日异环老婆默认关闭，可在控制台开启。
+图库启用令牌鉴权后填写 `DailyWifeGalleryToken`，令牌请进 QQ 交流群
+[798949533](https://qm.qq.com/q/pJVt8HNwrg) 获取，留空则不携带令牌。
 
 > [!WARNING]
 > 远程图库模式会从线上接口拉取并发送图片。部分图片可能存在风控风险，请自行评估是否启用；因使用远程图库产生的任何风险由部署者自行承担。
