@@ -77,7 +77,7 @@ git clone https://github.com/MimoKit/TodayWaifu
 
 感谢所有为 TodayWaifu 提交代码、修复问题、完善文档或提出建议的人。
 
-<a href="https://github.com/MimoKit/TodayWaifu/graphs/contributors"><img src="https://contributors-img.web.app/image?repo=MimoKit/TodayWaifu" alt="TodayWaifu contributors" width="600"></a>
+<a href="https://github.com/MimoKit/TodayWaifu/graphs/contributors"><img src="https://contributors-img.web.app/image?repo=MimoKit/TodayWaifu" alt="TodayWaifu contributors" width="360"></a>
 
 当前公开署名贡献者（已排除机器人账号）：
 
