@@ -73,7 +73,18 @@ git clone https://github.com/MimoKit/TodayWaifu
 
 <br/>
 
-<br/>
+## Contributors
+
+感谢所有为 TodayWaifu 提交代码、修复问题、完善文档或提出建议的人。
+
+<a href="https://github.com/MimoKit/TodayWaifu/graphs/contributors"><img src="https://contributors-img.web.app/image?repo=MimoKit/TodayWaifu" alt="TodayWaifu contributors" width="600"></a>
+
+当前公开署名贡献者（已排除机器人账号）：
+
+[MimoKit](https://github.com/MimoKit) · [CWalkene](https://github.com/CWalkene) · [spaxie](https://github.com/spaxie) · [Xbaiyz12](https://github.com/Xbaiyz12)
+
+> [!NOTE]
+> GitHub 还统计到匿名提交，因平台未提供身份信息无法列出；Dependabot、Copilot 等机器人不计入上方署名名单。
 
 <br/>
 
