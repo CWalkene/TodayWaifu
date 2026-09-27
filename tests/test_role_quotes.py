@@ -10,7 +10,7 @@ from dataclasses import dataclass
 ROOT = Path(__file__).resolve().parents[1]
 DAILY_PATH = ROOT / "TodayWaifu" / "daily.py"
 _CORE_DATA = ROOT.parents[2] / "data" / "TodayWaifu" / "role_quotes.json"
-_PLUGIN_DATA = ROOT / "data" / "TodayWaifu" / "role_quotes.json"
+_PLUGIN_DATA = ROOT / "role_quotes.json"
 DATA_FILE = _CORE_DATA if _CORE_DATA.is_file() else _PLUGIN_DATA
 ROLE_QUOTES_PATH = ROOT / "TodayWaifu" / "role_quotes.py"
 
@@ -124,6 +124,32 @@ class RoleQuotesTests(unittest.TestCase):
         self.assertIn("你今天的老婆是折枝", text)
         self.assertIn("——折枝", text)
         self.assertIn("「", text)
+
+    def test_build_text_omits_quote_when_disabled(self) -> None:
+        """台词开关关闭时不附带台词；关闭是默认值。"""
+        globals_dict = {
+            "RoleCandidate": _FakeRoleCandidate,
+            "_cfg_bool": lambda key, default=False: False,
+            "_daily_kind_metadata": lambda mode: _FakeKindMetadata(),
+            "_cfg": lambda key: None,
+            "get_role_quote": self.get_role_quote,
+        }
+        build_text = _extract_function(DAILY_PATH, "_build_text", globals_dict)
+        role = _FakeRoleCandidate("折枝", ("1105",), ("https://example.test/zhezhi.png",))
+        text = build_text(role, mode="wife", user_id="123456")
+        self.assertIn("你今天的老婆是折枝", text)
+        self.assertNotIn("——折枝", text)
+        self.assertNotIn("「", text)
+
+    def test_quote_switch_defaults_to_disabled(self) -> None:
+        """守卫：台词开关默认必须关闭，避免台词库缺失时静默开个空开关。"""
+        config_default = (ROOT / "config_default.py").read_text(encoding="utf-8")
+        block = config_default[config_default.index("'DailyWifeSendRoleQuote'") :]
+        block = block[: block.index("),")]
+        self.assertIn("False", block, "DailyWifeSendRoleQuote 默认值应为 False")
+
+        daily = DAILY_PATH.read_text(encoding="utf-8")
+        self.assertIn("_cfg_bool('DailyWifeSendRoleQuote', False)", daily, "代码兜底默认值应为 False")
 
 
 if __name__ == "__main__":
