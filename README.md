@@ -83,9 +83,6 @@ git clone https://github.com/MimoKit/TodayWaifu
 
 [MimoKit](https://github.com/MimoKit) · [CWalkene](https://github.com/CWalkene) · [spaxie](https://github.com/spaxie) · [Xbaiyz12](https://github.com/Xbaiyz12)
 
-> [!NOTE]
-> GitHub 还统计到匿名提交，因平台未提供身份信息无法列出；Dependabot、Copilot 等机器人不计入上方署名名单。
-
 <br/>
 
 ## Star History
