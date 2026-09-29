@@ -69,9 +69,7 @@ def _extract_context_builder():
     path = PACKAGE / 'daily_store.py'
     tree = ast.parse(path.read_text(encoding='utf-8'))
     function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == '_get_today_context'
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_get_today_context'
     )
     future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
     module = ast.Module(body=[future, function], type_ignores=[])
@@ -153,11 +151,7 @@ class DailyContextBucketTests(unittest.TestCase):
         metadata = _exec_module(PACKAGE / 'kind_metadata.py')['DAILY_KIND_METADATA']
         context = _extract_context_builder()()
 
-        missing = [
-            metadata[kind].bucket
-            for kind in constants
-            if metadata[kind].bucket not in context
-        ]
+        missing = [metadata[kind].bucket for kind in constants if metadata[kind].bucket not in context]
         self.assertEqual(missing, [], f'_get_today_context 未创建这些记录桶: {missing}')
 
     def test_non_record_buckets_are_still_created(self) -> None:
