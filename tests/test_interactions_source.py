@@ -109,13 +109,12 @@ class InteractionSourceTests(unittest.TestCase):
         self.assertIn('老婆帮助', help_source)
 
     def test_divorce_marks_selected_daily_record_with_divorced_state(self) -> None:
-        # 离婚状态判定与整批标记随 shared 拆分迁至 daily_store / daily_state
+        # 离婚状态判定与整批标记都住在 daily_store（daily_state.py 曾是重复实现，已删除）
         daily_store_source = (ROOT / 'TodayWaifu' / 'daily_store.py').read_text(encoding='utf-8')
-        daily_state_source = (ROOT / 'TodayWaifu' / 'daily_state.py').read_text(encoding='utf-8')
         divorce_source = (ROOT / 'TodayWaifu' / 'divorce.py').read_text(encoding='utf-8')
         self.assertIn("raw.get('divorced')", daily_store_source)
         self.assertIn("return 'divorced'", daily_store_source)
-        self.assertIn('ALL_DAILY_RECORD_KINDS', daily_state_source + daily_store_source)
+        self.assertIn('ALL_DAILY_RECORD_KINDS', daily_store_source)
         self.assertIn("context['safe_wives']", daily_store_source)
         self.assertIn("record['divorced'] = True", divorce_source)
 

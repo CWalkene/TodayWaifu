@@ -564,7 +564,8 @@ class DailyWifeRecord(BaseModel, table=True):
     ) -> int:
         """整体覆写某一天某个群的全部桶记录（先删后插，幂等）。
 
-        调用方必须持有 shared._daily_data_lock，保证读-改-写串行。
+        调用方必须持有该上下文的 `_daily_context_lock(ev)`（见 daily_store），
+        保证同一 (bot, group) 的读-改-写串行。
         """
         await session.execute(
             delete(cls)

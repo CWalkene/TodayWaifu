@@ -86,7 +86,6 @@ from .state import (
     _MEMBER_AVATAR_INFLIGHT,
     _GROUP_DISPLAY_NAME_CACHE,
     CUSTOM_ROLE_DELETE_PENDING,
-    _daily_data_lock,
 )
 from .domain import WifeRecord, RoleCandidate, MemberCandidate
 from .models import DailyWifeRecord
@@ -304,7 +303,7 @@ __all__ = [
     '_today_key', '_usable_cached_avatar', '_user_display_name', '_user_key',
     '_valid_display_name', '_valid_member_text', '_wife_data_path', '_wife_origin',
     '_wife_state', '_writable_role_map_path', '_writable_role_pile_root',
-    'DailyWifeRecord', '_daily_data_lock', '_migrate_legacy_wife_data',
+    'DailyWifeRecord', '_migrate_legacy_wife_data',
     'read_file_bytes_cached', 'is_url_cached', 'prefer_cached_urls',
     'asyncio', 'binascii', 'core_config', 'date', 'get_res_path',
     'assign_wife_sv', 'custom_role_sv', 'daily_husband_sv', 'daily_normal_wife_sv',

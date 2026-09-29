@@ -38,9 +38,6 @@ _IMAGE_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(8)
 CUSTOM_ROLE_DELETE_PENDING: dict[str, PendingCustomRoleDelete] = {}
 
 
-_daily_data_lock = asyncio.Lock()
-
-
 _CONTEXT_REGISTRY = ContextRegistry()
 
 

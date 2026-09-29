@@ -9,3 +9,10 @@ license = { text = "GPL-3.0-or-later" }
 # python / fastapi / pydantic / gsuid-core / sqlmodel / apscheduler / pydantic-ai
 # 等框架基础依赖无需声明；启动时框架会自动安装此处列出的依赖。
 dependencies = []
+
+[tool.gsuid]
+name = "TodayWaifu"
+desc = "多游戏「今日老婆」，含抽老婆 / 抢 / 送 / 离婚、萝莉 / 正太 / 异环 / 战双、自定义角色图库"
+version = "1.0.0"
+author = "MimoKit"
+icon = "ICON.png"

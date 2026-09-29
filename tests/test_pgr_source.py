@@ -74,7 +74,8 @@ class PgrFeatureSourceTests(unittest.TestCase):
         metadata = (ROOT / 'TodayWaifu' / 'kind_metadata.py').read_text(encoding='utf-8-sig')
         source = (ROOT / 'TodayWaifu' / 'pgr.py').read_text(encoding='utf-8-sig')
 
-        self.assertIn("context.setdefault('pgr_wives', {})", shared)
+        self.assertIn("for kind in ALL_DAILY_RECORD_KINDS", shared)
+        self.assertIn("context.setdefault(_daily_bucket_name(kind), {})", shared)
         self.assertIn('bucket="pgr_wives"', metadata)
         self.assertIn("_cfg('DailyWifePgrGalleryPath')", shared)
         self.assertIn("_daily_rng(ev, key, 'pgr_wife')", source)

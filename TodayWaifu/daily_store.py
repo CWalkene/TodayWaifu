@@ -263,12 +263,11 @@ async def _save_wife_data(data: WifeData) -> None:
 def _get_today_context(data: WifeData, ev: Event) -> DailyContext:
     day = data.setdefault('days', {}).setdefault(_today_key(), {})
     context = day.setdefault(_context_key(ev), {})
-    context.setdefault('wives', {})
-    context.setdefault('husbands', {})
-    context.setdefault('nte_wives', {})
-    context.setdefault('pgr_wives', {})
-    context.setdefault('lolis', {})
-    context.setdefault('shotas', {})
+    # 记录桶从 ALL_DAILY_RECORD_KINDS 派生，而不是逐行硬编码：这张表是新增
+    # 模式（如 normal）时唯一的真相源，漏写一个桶会让该模式的直接下标读取抛
+    # KeyError，被命令包装器吞掉后表现为「用户发命令没有任何回复」。
+    for kind in ALL_DAILY_RECORD_KINDS:
+        context.setdefault(_daily_bucket_name(kind), {})
     context.setdefault('marry_members', {})
     context.setdefault('rob_attempts', {})
     context.setdefault('safe_wives', {})

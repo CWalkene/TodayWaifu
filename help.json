@@ -43,6 +43,14 @@
         "need_admin": false
       },
       {
+        "name": "今日普通老婆",
+        "desc": "抽取今日普通老婆（跨作品动漫角色，可指定角色名或作品名）",
+        "eg": "今日普通老婆",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
         "name": "老婆列表",
         "desc": "查看本群今日老婆汇总",
         "eg": "老婆列表",
@@ -54,6 +62,14 @@
         "name": "老公列表",
         "desc": "查看本群今日老公汇总",
         "eg": "老公列表",
+        "need_ck": false,
+        "need_sk": false,
+        "need_admin": false
+      },
+      {
+        "name": "普通老婆列表",
+        "desc": "查看本群今日普通老婆汇总",
+        "eg": "普通老婆列表",
         "need_ck": false,
         "need_sk": false,
         "need_admin": false
@@ -222,7 +238,7 @@
       },
       {
         "name": "删除萝莉图片",
-        "desc": "删除指定图片（加ID删单张）或清空全部",
+        "desc": "删除指定图片（命令后带 8 位图片ID）；⚠️ 不带ID会清空全部本地萝莉图片，不可恢复",
         "eg": "删除萝莉图片 abcd1234",
         "need_ck": false,
         "need_sk": false,

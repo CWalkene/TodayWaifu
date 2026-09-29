@@ -456,7 +456,7 @@ async def _send_delete_loli(bot: Bot, ev: Event) -> None:
     aliases=['今日老婆·抽萝莉', '今日老婆·今日萝莉'],
 )
 async def daily_loli(bot: Bot, ev: Event) -> None:
-    if not _loli_enabled():  # noqa: F405
+    if not _loli_enabled():
         return
     await _send_loli_image(bot, ev)
 

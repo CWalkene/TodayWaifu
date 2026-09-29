@@ -19,6 +19,9 @@ class DailyKindMetadata:
     gift_success_default: str
 
 
+# `nte` / `pgr` 的空字符串表示该模式不参与抢/送：`_send_rob_daily` 与
+# `_send_gift_daily` 由 `_rob_enabled` / `_gift_enabled` 返回 False 直接放行，
+# 永远不会读到这些 key。守卫测试（tests/test_config_references.py）会跳过空值。
 DAILY_KIND_METADATA = {
     "wife": DailyKindMetadata(
         bucket="wives",
@@ -110,13 +113,15 @@ DAILY_KIND_METADATA = {
         role_mode="normal",
         text_template_key="DailyWifeNormalTextTemplate",
         text_template_default="你今天的老婆是来自{role_id}的{name}！",
-        rob_enabled_key="DailyWifeNormalRobEnabled",
-        rob_success_rate_key="DailyWifeRobSuccessRate",
-        rob_success_key="DailyWifeNormalRobSuccessTemplate",
-        rob_success_default="抢老婆成功！你把对方今天的老婆{name}抢过来了！",
-        gift_enabled_key="DailyWifeNormalGiftEnabled",
-        gift_success_key="DailyWifeNormalGiftSuccessTemplate",
-        gift_success_default="你把今天的老婆{name}送给了对方！",
+        # 普通老婆与丈夫图库一样没有抢/送入口（_load_candidates 不处理这两个 role_mode），
+        # 故 rob/gift 三件套留空，由 _rob_enabled / _gift_enabled 短路放行。
+        rob_enabled_key="",
+        rob_success_rate_key="",
+        rob_success_key="",
+        rob_success_default="",
+        gift_enabled_key="",
+        gift_success_key="",
+        gift_success_default="",
     ),
 }
 
