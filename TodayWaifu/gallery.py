@@ -294,6 +294,8 @@ def _download_image_sync(url: str) -> bytes:
     except HTTPError as exc:
         if exc.code == 401:
             raise RuntimeError('图库账号或密码不正确，图片返回 401。') from exc
+        if exc.code == 403:
+            raise RuntimeError('获取图库图片被拒绝(403)：需要有效访问令牌或令牌已失效。') from exc
         raise RuntimeError(f'下载图片失败，HTTP {exc.code}。') from exc
     except URLError as exc:
         raise RuntimeError(f'下载图片失败：{exc.reason}') from exc
