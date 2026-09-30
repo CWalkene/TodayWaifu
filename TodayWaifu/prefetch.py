@@ -24,6 +24,7 @@ from .constants import (
     PREFETCH_HOUR,
     PREFETCH_MINUTE,
     PREFETCH_MAX_SECONDS,
+    PREFETCH_DOWNLOAD_INTERVAL_SECONDS,
     PREFETCH_STARTUP_DELAY_SECONDS,
     _cfg_bool,
     _image_source,
@@ -54,6 +55,7 @@ async def _prefetch_once() -> dict[str, int]:
 
     cache_root = _gallery_image_cache_root()
     deadline = time.monotonic() + PREFETCH_MAX_SECONDS
+    last_download_at: float | None = None
 
     for mode in modes:
         if time.monotonic() >= deadline:
@@ -78,6 +80,14 @@ async def _prefetch_once() -> dict[str, int]:
                     if await run_blocking(read_url_cache, cache_root, url) is not None:
                         stats['cached'] += 1
                         continue
+                    if last_download_at is not None:
+                        wait = PREFETCH_DOWNLOAD_INTERVAL_SECONDS - (time.monotonic() - last_download_at)
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                            if time.monotonic() >= deadline:
+                                logger.info(f'{LOG_PREFIX} 预热达到时间上限，已停止')
+                                return stats
+                    last_download_at = time.monotonic()
                     await _download_image(url)
                     stats['downloaded'] += 1
                 except (OSError, RuntimeError, TimeoutError) as exc:
@@ -115,7 +125,7 @@ def seconds_until_prefetch(now: datetime | None = None) -> float:
     if current < target:
         return (target - current).total_seconds()
     if current.hour == PREFETCH_HOUR and current.minute >= PREFETCH_MINUTE:
-        # 正处于预热窗口（23:50 ~ 23:59），立刻补跑，而不是等 24 小时
+        # 正处于预热窗口（23:20 ~ 23:59），立刻补跑，而不是等 24 小时
         return 1.0
     target += timedelta(days=1)
     return (target - current).total_seconds()

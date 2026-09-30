@@ -86,13 +86,20 @@ CIRCUIT_COOLDOWN_SECONDS = 30.0
 # 零点前预热图库图片的时刻（本地时间）与时间上限。
 # 日期一翻转，`_daily_rng` 的种子就变，每个用户都会抽到新的图片 URL，
 # 磁盘缓存全部失效 —— 预热是为了让 00:00 的抽签直接命中缓存。
+# 预热请求需要服从图库的每 IP / 每 token 图片限流，不能等到 23:50
+# 再突发下载；提前开始并降低速率，给 00:00 留出完整缓存窗口。
 PREFETCH_HOUR = 23
 
 
-PREFETCH_MINUTE = 50
+PREFETCH_MINUTE = 20
 
 
-PREFETCH_MAX_SECONDS = 10 * 60
+PREFETCH_MAX_SECONDS = 30 * 60
+
+
+# 预热每次真实下载之间的间隔。当前图库默认图片限流为 60/min，
+# 6 秒约等于 10/min，给用户请求保留绝大多数额度；命中本地缓存不等待。
+PREFETCH_DOWNLOAD_INTERVAL_SECONDS = 6.0
 
 
 # 启动后多久补跑一次预热。重启可能发生在零点之后，那时缓存未必完整；

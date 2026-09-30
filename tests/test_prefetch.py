@@ -24,7 +24,7 @@ def _extract_scheduler() -> Any:
         'datetime': datetime,
         'timedelta': __import__('datetime').timedelta,
         'PREFETCH_HOUR': 23,
-        'PREFETCH_MINUTE': 50,
+        'PREFETCH_MINUTE': 20,
     }
     exec(compile(module, str(PREFETCH), 'exec'), globals_dict)
     return globals_dict['seconds_until_prefetch']
@@ -36,21 +36,21 @@ seconds_until_prefetch = _extract_scheduler()
 class PrefetchScheduleTests(unittest.TestCase):
     def test_waits_until_2350_on_the_same_day(self) -> None:
         delay = seconds_until_prefetch(datetime(2026, 9, 24, 20, 0, 0))
-        self.assertAlmostEqual(delay, 3 * 3600 + 50 * 60, delta=1.0)
+        self.assertAlmostEqual(delay, 3 * 3600 + 20 * 60, delta=1.0)
 
     def test_runs_immediately_inside_the_prefetch_window(self) -> None:
-        # 进程刚好在 23:55 启动：必须立刻补跑，而不是等 24 小时
-        for minute in (50, 55, 59):
+        # 进程刚好在预热窗口内启动：必须立刻补跑，而不是等 24 小时
+        for minute in (20, 35, 55, 59):
             with self.subTest(minute=minute):
                 delay = seconds_until_prefetch(datetime(2026, 9, 24, 23, minute, 0))
                 self.assertLessEqual(delay, 1.0)
 
     def test_schedules_next_day_after_midnight(self) -> None:
         delay = seconds_until_prefetch(datetime(2026, 9, 25, 0, 5, 0))
-        self.assertAlmostEqual(delay, 23 * 3600 + 45 * 60, delta=1.0)
+        self.assertAlmostEqual(delay, 23 * 3600 + 15 * 60, delta=1.0)
 
     def test_just_before_the_window_still_targets_today(self) -> None:
-        delay = seconds_until_prefetch(datetime(2026, 9, 24, 23, 49, 30))
+        delay = seconds_until_prefetch(datetime(2026, 9, 24, 23, 19, 30))
         self.assertAlmostEqual(delay, 30.0, delta=1.0)
 
     def test_delay_is_never_negative(self) -> None:
@@ -83,8 +83,20 @@ class PrefetchBoundednessTests(unittest.TestCase):
     def test_prefetch_runs_before_midnight(self) -> None:
         values = self._constants()
         self.assertEqual(values['PREFETCH_HOUR'], 23)
-        self.assertGreaterEqual(values['PREFETCH_MINUTE'], 30, '预热要留足下载时间')
+        self.assertEqual(values['PREFETCH_MINUTE'], 20, '预热应提前到 23:20，给限速下载留时间')
         self.assertLess(values['PREFETCH_MINUTE'], 60)
+
+    def test_prefetch_budget_and_interval_match_gallery_limit(self) -> None:
+        values = self._constants()
+        self.assertEqual(values['PREFETCH_MAX_SECONDS'], 30 * 60)
+        self.assertEqual(values['PREFETCH_DOWNLOAD_INTERVAL_SECONDS'], 6.0)
+
+    def test_prefetch_spaces_real_downloads_but_not_cache_hits(self) -> None:
+        source = PREFETCH.read_text(encoding='utf-8')
+        body = source[source.index('async def _prefetch_once(') : source.index('def _prefetch_modes(')]
+        self.assertIn('last_download_at', body)
+        self.assertIn('PREFETCH_DOWNLOAD_INTERVAL_SECONDS', body)
+        self.assertIn('read_url_cache', body)
 
     def test_prefetch_is_opt_outable_and_bounded_per_role(self) -> None:
         config = (ROOT / 'config_default.py').read_text(encoding='utf-8')
