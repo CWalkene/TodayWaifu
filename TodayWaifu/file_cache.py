@@ -15,6 +15,7 @@ import tempfile
 from typing import Optional
 from pathlib import Path
 from collections import OrderedDict
+from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
 # 本地文件字节缓存上限：同时限制条目数和总字节数，避免大图把核心进程内存吃满
 LOCAL_BYTES_CACHE_MAX_ENTRIES = 128
@@ -61,10 +62,46 @@ def clear_file_caches() -> None:
     _LOCAL_BYTES_CACHE_TOTAL_BYTES = 0
 
 
+# 图库用来表达「一次性授权」的查询参数：值会随时间变化，但指向的图片没变。
+# 常见于带短期签名的图库（如 ?e=<过期时间>&s=<签名>）或把令牌放进查询串的图库。
+_VOLATILE_QUERY_PARAMS = frozenset({'e', 's', 'token', 'sig', 'signature', 'expires', 'expire'})
+
+
+def canonical_url(url: str) -> str:
+    """剥离随时间变化的授权参数，得到稳定的资源标识。
+
+    图库可能给图片 URL 带上短期签名（`?e=<过期>&s=<签名>`）。签名每隔一段时间
+    就会变，但图片本身没变。若直接拿原始 URL 当缓存键，签名一换整库缓存就全部
+    失效：零点前的预热白做，磁盘还会按新键把同一张图重复存一份。
+
+    只剥离上面那几个已知的易变参数，其余参数原样保留 —— 避免把真正不同的资源
+    错误地合并成同一个缓存键。没有任何易变参数时原样返回，因此对旧的、不带签名
+    的 URL 而言缓存键与历史完全一致，不会让已缓存的图片失效。
+    """
+    text = str(url or '')
+    if not text:
+        return text
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text
+    if not parts.query:
+        return text
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    kept = [(key, value) for key, value in pairs if key.lower() not in _VOLATILE_QUERY_PARAMS]
+    if len(kept) == len(pairs):
+        return text
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
+
+
+def _cache_key(url: str) -> str:
+    """图片缓存键：对「去掉易变授权参数」后的 URL 取哈希。"""
+    return hashlib.sha256(canonical_url(url).encode('utf-8')).hexdigest()
+
+
 def url_hash_cache_path(cache_root: Path, url: str) -> Path:
-    """远程图片 URL 的磁盘缓存路径（内容寻址，URL 不变则命中）。"""
-    digest = hashlib.sha256(url.encode('utf-8')).hexdigest()
-    return cache_root / digest
+    """远程图片 URL 的磁盘缓存路径（内容寻址；忽略签名等易变参数）。"""
+    return cache_root / _cache_key(url)
 
 
 # ── 已缓存 URL 索引 ───────────────────────────────────────────────────────────
@@ -82,12 +119,16 @@ def _remember_cached_url(url: str) -> None:
     if len(_CACHED_URL_HASHES) >= CACHED_URL_INDEX_MAX:
         # 溢出就整体丢弃：只是失去提示，会退回全量图片，不影响正确性
         _CACHED_URL_HASHES.clear()
-    _CACHED_URL_HASHES.add(hashlib.sha256(url.encode('utf-8')).hexdigest())
+    _CACHED_URL_HASHES.add(_cache_key(url))
 
 
 def is_url_cached(url: str) -> bool:
-    """该 URL 的图片是否已在磁盘缓存里（纯内存查询，无 I/O）。"""
-    return hashlib.sha256(url.encode('utf-8')).hexdigest() in _CACHED_URL_HASHES
+    """该 URL 的图片是否已在磁盘缓存里（纯内存查询，无 I/O）。
+
+    与磁盘缓存同样忽略签名等易变参数：这样即使列表返回了新签名的 URL，
+    也能正确命中此前按旧签名下载的同一张图。
+    """
+    return _cache_key(url) in _CACHED_URL_HASHES
 
 
 def prefer_cached_urls(urls: tuple[str, ...]) -> tuple[str, ...]:

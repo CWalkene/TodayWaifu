@@ -166,13 +166,34 @@ class RetryPolicyTests(unittest.TestCase):
         self.assertIn('min(base, RETRY_MAX_DELAY_SECONDS)', fn)
 
     def test_auth_errors_bypass_the_breaker(self) -> None:
-        """401/403 是配置问题不是上游故障，不该把图库熔断掉。"""
+        """401/403/429 是客户端侧条件，不该把图库熔断掉。
+
+        403 是令牌问题、429 是限流，都重试无用也不是上游故障；若把它们算作
+        失败喂给熔断器，一次限流就会让图库被误熔断，之后所有请求快速失败并
+        回退本地，用户看到的是「图库挂了」。
+        """
         source = (PLUGIN / 'gallery.py').read_text(encoding='utf-8')
         helper = source[
             source.index('def _http_get_with_retry('):source.index('def _fetch_gallery_payload_sync(')
         ]
-        auth_branch = helper[helper.index('if exc.code in {401, 403}:'):]
+        marker = 'if exc.code in {401, 403, 429}:'
+        self.assertIn(marker, helper, '认证/限流错误必须走直接抛出分支')
+        auth_branch = helper[helper.index(marker):]
         self.assertIn('raise', auth_branch[:120])
+
+    def test_throttled_response_does_not_trip_the_breaker(self) -> None:
+        """429 必须与 401/403 同等对待：直接抛出，不计入熔断失败。"""
+        source = (PLUGIN / 'gallery.py').read_text(encoding='utf-8')
+        helper = source[
+            source.index('def _http_get_with_retry('):source.index('def _fetch_gallery_payload_sync(')
+        ]
+        marker = 'if exc.code in {401, 403, 429}:'
+        self.assertIn(marker, helper, '429 必须走直接抛出分支')
+
+        # 该分支内只应有 raise，不能出现把失败记给熔断器的调用
+        branch = helper[helper.index(marker):]
+        self.assertIn('raise', branch[:120])
+        self.assertNotIn('record_failure', branch[:120])
 
 
 if __name__ == '__main__':

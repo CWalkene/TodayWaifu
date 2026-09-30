@@ -37,6 +37,7 @@ from .shared import (
     image_upload_sv,
     _loli_image_root,
     _record_from_dict,
+    _auth_error_reason,
     _can_upload_images,
     _daily_context_lock,
     _load_daily_context,
@@ -205,11 +206,8 @@ def _fetch_loli_image_urls_sync(api_url: str) -> tuple[str, ...]:
     try:
         body = _http_get_with_retry(api_url, timeout=GALLERY_HTTP_TIMEOUT_SECONDS)
     except HTTPError as exc:
-        if exc.code == 403:
-            raise RuntimeError(
-                '请求萝莉图库接口失败(403)：图库接口需要访问令牌，'
-                '请在控制台配置「图库访问令牌」(DailyWifeGalleryToken)。'
-            ) from exc
+        if exc.code in {401, 403, 429}:
+            raise RuntimeError(_auth_error_reason(exc, what='请求萝莉图库接口')) from exc
         raise RuntimeError(f'请求萝莉图库接口失败，HTTP {exc.code}。') from exc
     except URLError as exc:
         raise RuntimeError(f'请求萝莉图库接口失败：{exc.reason}') from exc

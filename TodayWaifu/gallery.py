@@ -176,9 +176,12 @@ def _http_get_with_retry(
 ) -> bytes:
     """请求远程资源，失败或超时时按指数退避重试 `retries` 次。
 
-    401/403 属于认证或授权错误，重试无意义，直接抛出（也不喂给熔断器，
-    因为那是配置问题而不是上游故障）。连续失败达到阈值后熔断一段时间，
-    期间直接快速失败，不再打网络。
+    401/403/429 属于认证、授权或限流类错误：重试无意义（限流要等窗口过去），
+    直接抛出，**也不喂给熔断器** —— 它们是客户端侧条件，不是上游故障。
+    把限流当成上游故障会让图库被误熔断，之后所有请求都快速失败并回退本地，
+    用户看到的是「图库挂了」而不是「我们请求太快了」。
+
+    连续失败达到阈值后熔断一段时间，期间直接快速失败，不再打网络。
     """
     key = _circuit_key(url)
     if not _HTTP_BREAKER.allow(key):
@@ -191,7 +194,7 @@ def _http_get_with_retry(
         try:
             body = _http_get(url, timeout=timeout, max_bytes=max_bytes)
         except HTTPError as exc:
-            if exc.code in {401, 403}:
+            if exc.code in {401, 403, 429}:
                 raise
             last_exc = exc
         except (URLError, TimeoutError, OSError) as exc:
@@ -218,8 +221,8 @@ def _fetch_gallery_payload_sync() -> GalleryPayload:
     try:
         body = _http_get_with_retry(api_url, timeout=GALLERY_HTTP_TIMEOUT_SECONDS)
     except HTTPError as exc:
-        if exc.code == 401:
-            raise RuntimeError('图库账号或密码不正确，接口返回 401。') from exc
+        if exc.code in {401, 403, 429}:
+            raise RuntimeError(_auth_error_reason(exc, what='请求图库接口')) from exc
         raise RuntimeError(f'请求图库接口失败，HTTP {exc.code}。') from exc
     except URLError as exc:
         raise RuntimeError(f'请求图库接口失败：{exc.reason}') from exc
@@ -236,7 +239,22 @@ def _fetch_gallery_payload_sync() -> GalleryPayload:
 
 
 def _fetch_gallery_payload_from_url_sync(url: str) -> GalleryPayload:
-    body = _http_get_with_retry(url, timeout=GALLERY_HTTP_TIMEOUT_SECONDS)
+    """按给定地址拉取图库列表（战双 / 测试图库走这里）。
+
+    与 `_fetch_gallery_payload_sync` 一样，把认证/限流类错误转成可操作的中文提示：
+    这里原先会让 HTTPError 直接冒泡，调用方只能看到 `HTTP Error 403: Forbidden`，
+    既不知道是令牌问题还是 IP 被封，也无从下手。
+    """
+    try:
+        body = _http_get_with_retry(url, timeout=GALLERY_HTTP_TIMEOUT_SECONDS)
+    except HTTPError as exc:
+        if exc.code in {401, 403, 429}:
+            raise RuntimeError(_auth_error_reason(exc, what='请求图库接口')) from exc
+        raise RuntimeError(f'请求图库接口失败，HTTP {exc.code}。') from exc
+    except URLError as exc:
+        raise RuntimeError(f'请求图库接口失败：{exc.reason}') from exc
+    except TimeoutError as exc:
+        raise RuntimeError('请求图库接口超时。') from exc
     try:
         payload = json.loads(body.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -286,14 +304,46 @@ def _parse_role_candidates(
     return tuple(sorted(candidates, key=lambda role: role.name))
 
 
+def _auth_error_reason(exc: HTTPError, *, what: str) -> str:
+    """把图库的 401/403/429 转成可操作的中文提示。
+
+    图库侧可能因为多种原因拒绝：令牌缺失/错误/被注销、IP 被临时封禁、
+    请求过于频繁。这些都返回 403/429，单看状态码无法区分，所以顺带读一下
+    响应体里图库给出的 `error` 字段，让用户知道到底该改配置还是稍后重试。
+    """
+    code = getattr(exc, 'code', 0)
+    detail = ''
+    try:
+        raw = exc.read()
+        if raw:
+            payload = json.loads(raw.decode('utf-8', 'replace'))
+            if isinstance(payload, dict):
+                detail = str(payload.get('error') or '')
+    except (OSError, ValueError, AttributeError):
+        detail = ''
+
+    if code == 429 or detail in {'rate_limited', 'crawl_detected', 'quota_exceeded'}:
+        if detail == 'quota_exceeded':
+            return f'{what}失败(429)：今日访问配额已用尽，请明天再试或联系管理员调整配额。'
+        return f'{what}失败(429)：请求过于频繁，已被图库限流，请稍后再试。'
+    if detail == 'ip_banned':
+        return f'{what}失败(403)：当前 IP 已被图库封禁，请联系管理员解封。'
+    if code == 401:
+        return f'{what}失败(401)：图库令牌无效或已被注销，请在控制台更新「图库访问令牌」(DailyWifeGalleryToken)。'
+    return (
+        f'{what}失败(403)：图库拒绝了本次请求，通常是「图库访问令牌」缺失、错误或已被注销；'
+        f'请在控制台检查「图库访问令牌」(DailyWifeGalleryToken)。'
+    )
+
+
 def _download_image_sync(url: str) -> bytes:
     try:
         return _http_get_with_retry(
             url, timeout=IMAGE_HTTP_TIMEOUT_SECONDS, max_bytes=MAX_IMAGE_RESPONSE_BYTES
         )
     except HTTPError as exc:
-        if exc.code == 401:
-            raise RuntimeError('图库账号或密码不正确，图片返回 401。') from exc
+        if exc.code in {401, 403, 429}:
+            raise RuntimeError(_auth_error_reason(exc, what='下载图片')) from exc
         raise RuntimeError(f'下载图片失败，HTTP {exc.code}。') from exc
     except URLError as exc:
         raise RuntimeError(f'下载图片失败：{exc.reason}') from exc

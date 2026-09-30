@@ -24,6 +24,7 @@ from .shared import (
     _record_to_dict,
     _send_shota_text,
     _record_from_dict,
+    _auth_error_reason,
     _daily_context_lock,
     _load_daily_context,
     _save_daily_records,
@@ -105,10 +106,8 @@ def _fetch_shota_image_urls_sync(api_url: str) -> tuple[str, ...]:
     try:
         body = _http_get_with_retry(normalized_url, timeout=GALLERY_HTTP_TIMEOUT_SECONDS)
     except HTTPError as exc:
-        if exc.code == 403:
-            raise RuntimeError(
-                '请求正太图库接口失败(403)：图库接口需要访问令牌，请在控制台配置「图库访问令牌」(DailyWifeGalleryToken)。'
-            ) from exc
+        if exc.code in {401, 403, 429}:
+            raise RuntimeError(_auth_error_reason(exc, what='请求正太图库接口')) from exc
         raise RuntimeError(f'请求正太图库接口失败，HTTP {exc.code}。') from exc
     except URLError as exc:
         raise RuntimeError(f'请求正太图库接口失败：{exc.reason}') from exc
