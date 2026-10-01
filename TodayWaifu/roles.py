@@ -35,9 +35,12 @@ from .constants import (
     NTE_EXCLUDED_ROLE_KEYWORDS,
     _cfg_bool,
 )
-from .file_cache import prefer_cached_urls, read_file_text_cached
+from .file_cache import prefer_cached_urls, read_file_bytes_cached
 from .folder_gallery import scan_named_role_directories
 from .role_map_store import loads_role_map
+
+# (路径, 分节) -> (源字节对象, 解析结果)；对照表只有几个，不需要上限
+_ROLE_MAP_PARSE_CACHE: dict[tuple[str, str | None], tuple[bytes, dict[str, str]]] = {}
 
 
 def _pick_role_record(
@@ -61,12 +64,18 @@ def _pick_role_record(
 def _load_role_map(path: Path, section: str | None = None) -> dict[str, str]:
     """读取角色对照表（JSON 或旧 TXT），按 mtime 缓存文件内容避免每次抽签读盘。"""
     try:
-        text = read_file_text_cached(path)
+        raw = read_file_bytes_cached(path)
     except OSError:
         return {}
-    result = loads_role_map(text, section)
-    logger.debug(f'{LOG_PREFIX} 加载了 {len(result)} 个角色 ID 映射关系')
-    return result
+    # 字节缓存命中时返回的是同一个 bytes 对象，借此跳过重复的 JSON 解析；
+    # 返回副本，因为调用方会就地 update
+    cache_key = (str(path), section)
+    parsed = _ROLE_MAP_PARSE_CACHE.get(cache_key)
+    if parsed is None or parsed[0] is not raw:
+        parsed = (raw, loads_role_map(raw.decode('utf-8'), section))
+        _ROLE_MAP_PARSE_CACHE[cache_key] = parsed
+        logger.debug(f'{LOG_PREFIX} 加载了 {len(parsed[1])} 个角色 ID 映射关系')
+    return dict(parsed[1])
 
 
 def _load_custom_upload_role_map() -> dict[str, str]:

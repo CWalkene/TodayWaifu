@@ -1,13 +1,11 @@
 """TodayWaifu 的结果图片发送。"""
 from __future__ import annotations
 
-import io
+import time
 import asyncio
 from base64 import b64encode
 from pathlib import Path
 from dataclasses import dataclass
-
-from PIL import Image
 
 from gsuid_core.bot import Bot
 from gsuid_core.logger import logger
@@ -15,6 +13,7 @@ from gsuid_core.models import Message
 from gsuid_core.segment import IS_UPLOAD, MessageSegment
 from gsuid_core.ai_core.trigger_bridge import ai_return
 
+from .paths import _gallery_image_cache_root
 from .roles import _load_local_candidates
 from .domain import RoleCandidate
 from .gallery import _download_image
@@ -27,6 +26,7 @@ from .constants import (
     _daily_item_title,
 )
 from .file_cache import read_file_bytes_cached
+from .image_shrink import shrink_image_cached
 
 
 def _ai_return_draw(kind: str, name: str, text: str | None) -> None:
@@ -50,16 +50,33 @@ def _ai_return_draw(kind: str, name: str, text: str | None) -> None:
     except Exception as exc:
         logger.warning(f'{LOG_PREFIX} ai_return 数据提取失败: {exc}')
 
+_VALID_IMAGE_REF_TTL_SECONDS = 60.0
+_VALID_IMAGE_REF_CACHE: dict[str, float] = {}
+
+
 def _is_valid_image_ref(image: str) -> bool:
     if not image:
         return False
     # 图库模式下 image 是 http(s) URL，不是本地文件，发送时再下载校验
     if image.startswith(('http://', 'https://')):
         return True
+    # 每条记录读取都会走到这里（老婆列表一次就是全群记录数），而它跑在事件循环上：
+    # 只缓存「存在」的结论且短 TTL，文件被删后最多晚 60 秒发现，发送前还会再查一次
+    now = time.monotonic()
+    checked_at = _VALID_IMAGE_REF_CACHE.get(image)
+    if checked_at is not None and now - checked_at < _VALID_IMAGE_REF_TTL_SECONDS:
+        return True
     try:
-        return Path(image).is_file()
+        exists = Path(image).is_file()
     except (OSError, ValueError):
         return False
+    if exists:
+        if len(_VALID_IMAGE_REF_CACHE) >= 4096:
+            _VALID_IMAGE_REF_CACHE.clear()
+        _VALID_IMAGE_REF_CACHE[image] = now
+    else:
+        _VALID_IMAGE_REF_CACHE.pop(image, None)
+    return exists
 
 
 async def _find_local_role_image(role: RoleCandidate, kind: str) -> str | None:
@@ -89,61 +106,27 @@ def _encode_base64_ref(data: bytes) -> str:
     return f'base64://{b64encode(data).decode()}'
 
 
+def _shrink_limit_bytes() -> int:
+    return int(_cfg('DailyWifeImageMaxSizeMB') or 0) * 1024 * 1024
+
+
 def _shrink_image_sync(image: bytes | bytearray) -> bytes:
-    """图片超过配置阈值时转压为 WebP 字节，压不动或非动图失败则原样返回。
+    """图片超过配置阈值时转压为 WebP（无 WebP 时 JPEG），结果按原图内容落盘缓存。
 
-    用 WebP 而不是 JPEG：同画质下体积小得多（同一张图实测 WebP q85 约 141KB，
-    JPEG q85 约 467KB），而且支持 alpha —— 立绘大多是带透明通道的 PNG，
-    转 JPEG 会把透明区域压成黑底。
-    运行环境的 Pillow 若没编 WebP，则退回 JPEG。
+    压缩是零点高峰最重的 CPU 开销（单张大图秒级），同一张图只压一次，
+    之后直接读缓存；细节见 `image_shrink` 模块。
     """
-    limit_mb = int(_cfg('DailyWifeImageMaxSizeMB') or 0)
-    limit = limit_mb * 1024 * 1024
-    if limit <= 0:
-        return bytes(image)
-
     raw = bytes(image)
-    if len(raw) <= limit:
+    limit = _shrink_limit_bytes()
+    if limit <= 0 or len(raw) <= limit:
         return raw
-
-    webp_ok = 'WEBP' in Image.SAVE
-    try:
-        with Image.open(io.BytesIO(raw)) as opened:
-            if bool(getattr(opened, 'is_animated', False)):
-                return raw
-            has_alpha = opened.mode in ('RGBA', 'LA', 'PA') or (
-                opened.mode == 'P' and 'transparency' in opened.info
-            )
-            if webp_ok:
-                # WebP 支持 alpha，保留透明通道
-                working = opened.convert('RGBA' if has_alpha else 'RGB')
-            elif has_alpha:
-                # 退回 JPEG 时 alpha 会丢，合成到白底，避免透明区域变黑
-                rgba = opened.convert('RGBA')
-                working = Image.new('RGB', rgba.size, (255, 255, 255))
-                working.paste(rgba, mask=rgba.split()[-1])
-            else:
-                working = opened.convert('RGB')
-    except Exception:
-        # 解码失败（含 DecompressionBombError）一律原样返回，不影响发送
-        return raw
-
-    for max_side in (1920, 1600, 1280, 1024, 800, 640):
-        working.thumbnail((max_side, max_side))
-        for quality in (85, 75, 65, 55, 45):
-            buffer = io.BytesIO()
-            if webp_ok:
-                working.save(buffer, format='WEBP', quality=quality, method=4)
-            else:
-                working.save(buffer, format='JPEG', quality=quality, optimize=True)
-            data = buffer.getvalue()
-            if len(data) <= limit:
-                logger.info(
-                    f'{LOG_PREFIX} 图片 {len(raw) / 1048576:.1f}MB 超过阈值，'
-                    f'已压缩至 {len(data) / 1048576:.2f}MB 后发送'
-                )
-                return data
-    return raw
+    data = shrink_image_cached(raw, limit, _gallery_image_cache_root())
+    if data is not raw:
+        logger.debug(
+            f'{LOG_PREFIX} 图片 {len(raw) / 1048576:.1f}MB 超过阈值，'
+            f'已压缩至 {len(data) / 1048576:.2f}MB 后发送'
+        )
+    return data
 
 
 async def _image_message(data: bytes) -> Message:

@@ -52,6 +52,7 @@ async def _prefetch_once() -> dict[str, int]:
     # 延迟导入：避免与 shared 的导入顺序耦合
     from .paths import _gallery_image_cache_root
     from .gallery import _download_image, _load_candidates
+    from .senders import _shrink_image_sync
 
     cache_root = _gallery_image_cache_root()
     deadline = time.monotonic() + PREFETCH_MAX_SECONDS
@@ -77,8 +78,11 @@ async def _prefetch_once() -> dict[str, int]:
                 if not url.startswith(('http://', 'https://')):
                     continue
                 try:
-                    if await run_blocking(read_url_cache, cache_root, url) is not None:
+                    cached = await run_blocking(read_url_cache, cache_root, url)
+                    if cached is not None:
                         stats['cached'] += 1
+                        # 已下载但可能还没压过（如阈值刚改过）：顺带压好，压过的只是一次读盘
+                        await run_blocking(_shrink_image_sync, cached)
                         continue
                     if last_download_at is not None:
                         wait = PREFETCH_DOWNLOAD_INTERVAL_SECONDS - (time.monotonic() - last_download_at)
@@ -88,7 +92,9 @@ async def _prefetch_once() -> dict[str, int]:
                                 logger.info(f'{LOG_PREFIX} 预热达到时间上限，已停止')
                                 return stats
                     last_download_at = time.monotonic()
-                    await _download_image(url)
+                    data = await _download_image(url)
+                    # 预热时就把压缩做掉，00:00 发送只剩一次读盘
+                    await run_blocking(_shrink_image_sync, data)
                     stats['downloaded'] += 1
                 except (OSError, RuntimeError, TimeoutError) as exc:
                     stats['failed'] += 1
