@@ -4,7 +4,10 @@ from pathlib import Path
 
 from gsuid_core.data_store import get_res_path
 
+# BASE_DIR 指向插件仓库根目录，用于定位随插件分发的只读资源；用户数据一律经
+# data_root() 落到 Core 的资源目录，两者不可混用，否则升级会覆盖用户数据。
 BASE_DIR = Path(__file__).parent.parent
+# 内置角色对照表：升级时随插件一同替换，因此只能读、不能在上层写回。
 ROLE_MAP_JSON_PATH = BASE_DIR / 'role_id_map.json'
 LEGACY_ROLE_MAP_PATH = BASE_DIR / 'role_id_map.txt'
 HELP_ICON_PATH = BASE_DIR / 'ICON.png'
@@ -16,14 +19,17 @@ BUNDLED_ROLE_QUOTES_PATH = BASE_DIR / ROLE_QUOTES_FILE_NAME
 
 
 def data_root() -> Path:
+    """用户数据根目录，由 Core 按部署环境解析，插件不得假设其具体位置。"""
     return get_res_path('TodayWaifu')
 
 
 def role_upload_map() -> Path:
+    # 自定义角色对照表与内置表分离：写入用户目录才能跨升级保留，且避免污染只读资源。
     return data_root() / 'custom_role_map.json'
 
 
 def role_upload_root() -> Path:
+    # 图片按角色 ID 分目录存放，删除角色时整目录移除即可，不会牵连其它角色。
     return data_root() / 'custom_role_pile'
 
 

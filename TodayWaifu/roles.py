@@ -39,7 +39,7 @@ from .file_cache import prefer_cached_urls, read_file_bytes_cached
 from .folder_gallery import scan_named_role_directories
 from .role_map_store import loads_role_map
 
-# (路径, 分节) -> (源字节对象, 解析结果)；对照表只有几个，不需要上限
+# (路径, 分节) -> (源字节对象, 解析结果)；对照表只有几个，无需设容量上限
 _ROLE_MAP_PARSE_CACHE: dict[tuple[str, str | None], tuple[bytes, dict[str, str]]] = {}
 
 
@@ -49,10 +49,10 @@ def _pick_role_record(
 ) -> 'WifeRecord | None':
     """随机挑一个角色，并在该角色的图片里优先挑**已在磁盘缓存中**的那张。
 
-    零点前预热只暖每个角色的前几张图，而这里原来是 `rng.choice(role.images)`：
-    角色有 10 张图、只暖 2 张的话命中率只有 20%，剩下 80% 照样在零点走网络。
-    优先从已缓存的图里挑，预热的命中率就变成 100%（仍然随机，只是随机范围
-    收敛到已缓存的图；一张都没缓存时退回全量，行为与原来完全一致）。
+    零点前预热只覆盖每个角色的前几张图，而此前的实现是 `rng.choice(role.images)`：
+    角色有 10 张图、只暖 2 张时命中率仅 20%，其余 80% 仍会在零点走网络。改从已缓存的
+    图里挑，预热命中率即提升到 100%——随机性依旧保留，只是随机范围收敛到已缓存的那批；
+    一张都没缓存时 `prefer_cached_urls` 返回全量列表，行为与原来完全一致。
     """
     if not candidates:
         return None
@@ -86,6 +86,8 @@ def _load_custom_upload_role_map() -> dict[str, str]:
 
 
 def _role_images(role_dir: Path) -> tuple[str, ...]:
+    # 递归扫描以覆盖角色目录下的多级子目录；排序保证同一角色图片顺序稳定，
+    # 使抽签结果在相同种子下可复现
     images = [
         path
         for path in role_dir.rglob('*')
@@ -134,6 +136,7 @@ def _collect_role_candidates(
         if not images:
             continue
 
+        # 同一角色名可能对应多个 ID（跨作品同名或改过 ID），按名归并后图片合并去重
         bucket = grouped.setdefault(role_name, {'role_ids': [], 'images': []})
         bucket['role_ids'].append(role_id)
         bucket['images'].extend(images)
@@ -152,6 +155,7 @@ def _collect_role_candidates(
 
 
 def _load_custom_upload_candidates() -> tuple[RoleCandidate, ...]:
+    # 只扫描上传目录，故传入不存在的占位路径，使 XWUID 自定义目录分支必然短路
     role_map = _load_custom_upload_role_map()
     if not role_map:
         return ()
@@ -172,6 +176,8 @@ def _merge_role_candidates(
     base: tuple[RoleCandidate, ...],
     extra: tuple[RoleCandidate, ...],
 ) -> tuple[RoleCandidate, ...]:
+    # 按去符号化后的角色名归并：同一角色在不同数据源里的写法可能有细微差异，
+    # ID 与图片列表在此合并去重，避免同一角色以多条候选重复出现
     if not extra:
         return base
     if not base:
@@ -217,9 +223,10 @@ def _load_mode_role_map(mode: str = 'wife') -> dict[str, str]:
 def _load_local_candidates(mode: str = 'wife') -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
     """加载本地图片候选，带 TTL 缓存。
 
-    这是 `rglob` 全量目录扫描，很贵。图库挂掉时**每次**发送失败都会走
-    `_find_local_role_image` 回退到这里，没有缓存就等于图库一挂就把插件
-    线程池铺满目录扫描。上传图片时 `_invalidate_candidate_cache` 会主动失效。
+    该路径执行 `rglob` 全量目录扫描，代价高昂。图库不可用时每次发送失败都会经
+    `_find_local_role_image` 回退至此，若不加缓存，图库一挂即会耗尽插件线程池做目录扫描。
+    TTL 到期才会重新扫描，上传图片时由 `_invalidate_candidate_cache` 主动失效，
+    因此用户新增图片的可见延迟受 TTL 约束而非立即生效。
     """
     role_mode = _role_mode(mode)
     cache_key = f'local:{role_mode}'
@@ -238,6 +245,10 @@ def _load_local_candidates(mode: str = 'wife') -> tuple[tuple[RoleCandidate, ...
 def _scan_local_candidates(
     role_mode: str,
 ) -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
+    # 执行一次本地目录全量扫描，返回候选列表或面向用户的失败原因。
+    # 失败一律返回可读文案而非抛出异常，因为调用方需要把原因直接回给用户；
+    # 且 (None, 原因) 表示扫描失败、((), None) 表示确实无角色，故失败时
+    # 不得返回空元组，否则上层只能给出笼统的「没有可用角色」。
     title = _role_map_title(role_mode)
     logger.debug(f'{LOG_PREFIX} 开始从本地加载{title}角色候选列表...')
     role_map_path = _resolve_role_map_path(role_mode)
@@ -332,6 +343,7 @@ def _load_nte_local_candidates(
                     images = (str(default_image),)
                     break
 
+        # 允许远端兜底时用 CDN 占位，实际可用性交给发送阶段的下载失败处理
         if not images and allow_remote_fallback:
             images = (f'{NTE_DETAIL_CDN_BASE}/{role_id}.png',)
         if not images:
@@ -364,6 +376,7 @@ def _load_pgr_local_candidates() -> tuple[RoleCandidate, ...]:
 
 
 def _normalize_role_name(name: str) -> str:
+    # 不同来源对间隔号的写法不一致，统一为「·」后再比较，避免同一角色被判为不同名字
     return name.replace('・', '·').replace('•', '·').strip()
 
 
@@ -371,6 +384,7 @@ _MALE_ROLE_NAMES_NORM = {_normalize_role_name(n) for n in EXCLUDED_ROLE_NAMES}
 
 
 def _is_male_role(name: str) -> bool:
+    # 老公对照表可被用户覆盖，优先采用；缺失时退回内置名单，避免用户未配置时误选男性角色
     husband_names = {
         _normalize_role_name(role_name)
         for role_name in _load_mode_role_map('husband').values()
@@ -414,6 +428,7 @@ def _filter_by_mode(
         return candidates
     if role_mode == 'wife' and _cfg_bool('DailyWifeNormalEnabled', False):
         return candidates
+    # 兼容整体开关：同时按 ID 与规范化角色名匹配，以便本地图片目录名与对照表键不一致时仍能筛选
     role_map = _load_mode_role_map(mode)
     if role_mode == 'wife':
         role_map.update(_load_custom_upload_role_map())

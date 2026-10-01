@@ -30,11 +30,15 @@ from .image_shrink import shrink_image_cached
 
 
 def _ai_return_draw(kind: str, name: str, text: str | None) -> None:
-    """把本次抽取/流转结果作为 AI 可读摘要注入。
+    """将本次抽取结果注入为 AI 可读摘要。
 
-    用户直接触发时 `ai_return` 是空操作；AI 调用时这段文字会成为工具返回值，
-    让 AI 知道"抽到了谁"。按 skill §17.3，观测性代码允许 try/except：提取失败
-    绝不能影响图片生成与发送。
+    该摘要是 AI 工具调用唯一的语义出口：图片段只携带资源标识，无法回答"抽到了谁"，
+    因此角色名与文案必须在返回前以文本形式一并回传。用户直接触发时 `ai_return` 为空
+    操作，该调用的代价可忽略。
+
+    摘要按可用字段降级拼接，任一字段缺失都不构成错误。异常在此处吞掉而不外抛：观测性
+    写入失败属于旁路故障，其后果（AI 答复缺少文字摘要）远轻于因此中断图片生成与投递。
+    按 skill §17.3，观测性代码允许 try/except。
     """
     try:
         title = _daily_item_title(kind)
@@ -57,11 +61,15 @@ _VALID_IMAGE_REF_CACHE: dict[str, float] = {}
 def _is_valid_image_ref(image: str) -> bool:
     if not image:
         return False
-    # 图库模式下 image 是 http(s) URL，不是本地文件，发送时再下载校验
+    # 图库模式下列取自远程 URL，本地无从判断其可用性，故一律先判为有效，
+    # 由发送阶段的实际下载负责校验并触发回退
     if image.startswith(('http://', 'https://')):
         return True
-    # 每条记录读取都会走到这里（老婆列表一次就是全群记录数），而它跑在事件循环上：
-    # 只缓存「存在」的结论且短 TTL，文件被删后最多晚 60 秒发现，发送前还会再查一次
+    # 该判断位于事件循环的同步路径上，且列表类命令会按记录数逐条调用（单次可达全群规模），
+    # 因此以短 TTL 缓存规避重复 stat。缓存只记录「存在」这一结论：路径被删除后至多延迟
+    # TTL 才被发现，而发送前还会再次校验，故不会据此发出失效路径；反向的否定结论不缓存，
+    # 使新增文件立即可见，不必等待 TTL 过期。容量达上限时整体清空而非逐条淘汰，因该缓存
+    # 仅用于省去系统调用，未命中只会退化为一次探测，丢失全部条目的代价可忽略。
     now = time.monotonic()
     checked_at = _VALID_IMAGE_REF_CACHE.get(image)
     if checked_at is not None and now - checked_at < _VALID_IMAGE_REF_TTL_SECONDS:
@@ -80,7 +88,12 @@ def _is_valid_image_ref(image: str) -> bool:
 
 
 async def _find_local_role_image(role: RoleCandidate, kind: str) -> str | None:
-    """图库图片下载失败时，尝试从本地图片目录为该角色找一张图。"""
+    """图库图片不可用时，从本地图片目录为该角色挑选一张替代图。
+
+    匹配以名称相同或角色 ID 相交为准：同一角色在图库与本地目录中的名称写法未必一致
+    （别名、异体字等），仅凭名称会漏匹配；ID 相交则能在名称缺失或改写时仍定位到同一
+    角色。两级判据取并集，宁可匹配到名称相近的角色，也不返回空而使整条发送失败。
+    """
     try:
         candidates, error = await run_blocking(_load_local_candidates, kind)
     except (OSError, ValueError) as exc:
@@ -102,7 +115,11 @@ class _ImageAcquireTimeout(RuntimeError):
 
 
 def _encode_base64_ref(data: bytes) -> str:
-    """把图片字节编码成 `base64://` 引用（在线程池里调用）。"""
+    """将图片字节编码为 `base64://` 引用；仅供插件线程池调用。
+
+    编码为纯 CPU 操作，耗时随图片体积线性增长，必须与事件循环隔离。调用方有义务通过
+    线程池投递本函数，不得在协程内直接调用。
+    """
     return f'base64://{b64encode(data).decode()}'
 
 
@@ -111,10 +128,12 @@ def _shrink_limit_bytes() -> int:
 
 
 def _shrink_image_sync(image: bytes | bytearray) -> bytes:
-    """图片超过配置阈值时转压为 WebP（无 WebP 时 JPEG），结果按原图内容落盘缓存。
+    """超过配置阈值的图片转压为 WebP（不可用时退化为 JPEG），结果按原图内容落盘缓存。
 
-    压缩是零点高峰最重的 CPU 开销（单张大图秒级），同一张图只压一次，
-    之后直接读缓存；细节见 `image_shrink` 模块。
+    图片压缩是零点高峰最重的 CPU 开销，单张大图可达秒级；以原图内容为缓存键，可使同一
+    张图片在多次发送之间只压缩一次，后续直接读缓存。阈值取 0 表示关闭压缩，此时原样
+    返回，避免用户关闭该功能后仍承担一次无收益的哈希与查盘开销。
+    细节见 `image_shrink` 模块。
     """
     raw = bytes(image)
     limit = _shrink_limit_bytes()
@@ -130,15 +149,16 @@ def _shrink_image_sync(image: bytes | bytearray) -> bytes:
 
 
 async def _image_message(data: bytes) -> Message:
-    """把图片字节转成消息段，base64 编码在插件线程池里完成。
+    """构造图片消息段，base64 编码下沉至插件线程池执行。
 
-    框架的 `MessageSegment.image(bytes)` 会**在事件循环上**同步执行
-    `b64encode(...).decode()`：实测 2MB 图约 8.8ms、10MB 图约 47.7ms，
-    25 个命令并发时就是几百毫秒的串行阻塞，整个 Core 一起卡。
-    预先编码成 `base64://` 再传入，框架（`IS_UPLOAD` 为假时）会原样透传，
-    事件循环上不再有任何编码开销。
+    框架的 `MessageSegment.image(bytes)` 会在事件循环上同步执行
+    `b64encode(...).decode()`：实测 2MB 图约 8.8ms、10MB 图约 47.7ms。该开销不会并行
+    摊薄，而是在事件循环上串行累加，25 个命令并发即为数百毫秒的全局停顿，波及 Core 内
+    所有插件。预先编码为 `base64://` 后传入，框架（`IS_UPLOAD` 为假时）原样透传，
+    事件循环不再承担任何编码开销。
 
-    `EnablePicSrv` 打开时框架需要原始字节做图床上传，这时只能把字节交给框架。
+    `EnablePicSrv` 打开时框架需取得原始字节以完成图床上传，预先编码会破坏该链路，
+    因此该分支必须保留原始字节传递。
     """
     if IS_UPLOAD:
         return MessageSegment.image(data)
@@ -146,21 +166,25 @@ async def _image_message(data: bytes) -> Message:
 
 
 async def _image_message_from_path(path: Path) -> Message:
-    """从本地文件构造图片消息段；读盘与编码都在线程池里完成。"""
+    """由本地文件构造图片消息段；读盘与编码均在插件线程池内完成。
+
+    列图类命令会连续构造大量此类消息段，任一环节留在事件循环上，都会按图片数量累积成
+    可感知的卡顿，故此处不接受任何在循环内完成的简化实现。
+    """
     return await _image_message(await run_blocking(read_file_bytes_cached, path))
 
 
 async def _acquire_gallery_image(image_url: str) -> bytes:
-    """获取图库图片字节，超时即放弃等待。
+    """获取图库图片字节，超时仅放弃等待。
 
-    超时只放弃「等待」，**不取消底层下载任务**：`asyncio.shield` 让
-    `_download_image` 的内部任务继续在插件线程池里跑完并写入磁盘缓存，
-    下一个请求直接命中。若直接用 `wait_for` 包住，取消会顺着 `await task`
-    传递下去把下载也掐断，缓存永远暖不起来。
+    超时不得取消底层下载任务：`asyncio.shield` 使 `_download_image` 的内部任务脱离
+    等待方独立运行，继续在插件线程池中完成下载并写入磁盘缓存，后续请求可直接命中。
+    若改用 `wait_for` 直接包裹，取消会沿 `await task` 向下传播并中断下载，既令已付出的
+    网络开销失效，也使缓存始终无法预热。
 
-    这样命令协程最多占用 Core 的命令并发额度 `IMAGE_ACQUIRE_TIMEOUT_SECONDS` 秒，
-    而不是被重试链拖到几十秒 —— 后者会让 bot 的 `_process` 停止消费队列，
-    导致**整个 Core 所有命令**一起卡住。
+    该上限约束的是命令协程占用 Core 命令并发额度的时间：命令协程返回前额度不予归还，
+    而重试链的最坏耗时可达数十秒；一旦额度被占满，bot 的 `_process` 将停止消费队列，
+    Core 内所有插件的命令会一并停滞。
     """
     try:
         return await asyncio.wait_for(
@@ -200,7 +224,8 @@ async def _deliver_role_image(
             logger.warning(f'{LOG_PREFIX} 本地图片不存在: {image_url}')
             await _safe_send(bot, '本地图片文件不存在，请检查 custom_role_pile 目录。')
             return
-        # 本地图片按 (路径, mtime) 缓存字节，避免高峰期核心反复读盘转 base64
+        # 本地图片以 (路径, mtime_ns, 大小) 为键缓存字节：零点高峰同一路径会被反复读取，
+        # 逐次读盘与编码开销显著，缓存命中即可省去
         image = await run_blocking(read_file_bytes_cached, Path(image_url))
 
     image = await run_blocking(_shrink_image_sync, image)
@@ -255,7 +280,7 @@ async def _deliver_loli_result_image(
                 await _send_loli_text(bot, str(exc))
                 return
         else:
-            # 本地图片走 mtime 字节缓存，避免重复读盘
+            # 本地图片同样经字节缓存读取，避免同一文件在高峰期内重复读盘
             image_ref = await run_blocking(read_file_bytes_cached, Path(image))
     else:
         image_ref = image
@@ -269,14 +294,16 @@ _deliver_shota_result_image = _deliver_loli_result_image
 
 
 # ── 图片投递队列 ──────────────────────────────────────────────────────────────
-# 框架 `bot.py` 的 `_process` 是「先拿命令并发额度、再跑协程」，额度在协程结束
-# 时才归还。所以只要命令协程还在等图库下载，它就一直占着 Core 的
-# `CommandSemaphore` 名额；25 个名额被占满后 `_process` 直接停止消费队列，
-# 该 bot 上**所有插件**的命令一起卡住。
+# 框架 `bot.py` 的 `_process` 先取得命令并发额度、再执行协程，额度要到协程返回时才归还。
+# 命令协程只要仍在等待图库下载，就始终占用 Core 的 `CommandSemaphore` 名额；名额耗尽后
+# `_process` 停止消费队列，该 bot 上所有插件的命令一并停滞。
 #
-# 因此把「下载 + 编码 + 发送」整段搬到插件自己的有界队列里，命令协程只做入队
-# 就返回（微秒级），Core 的命令额度立刻归还。用户拿到的图片晚一点点到，
-# 但整个 Core 不会被一个插件的网络等待拖死。
+# 因此将「下载 + 编码 + 发送」整段迁入插件自有的有界队列，命令协程仅完成入队即返回
+# （微秒级），Core 的命令额度随即归还。代价是图片到达时刻略有延后，收益是单个插件的
+# 网络等待不再波及整个 Core 的命令处理能力。
+#
+# 队列有界且写入非阻塞：积压代表下游投递能力已达上限，此时须立即降级而非排队等待，
+# 否则等待会重新占用命令额度，本次改造即失去意义。
 IMAGE_DELIVERY_QUEUE_MAX = 512
 
 
@@ -322,7 +349,11 @@ async def _image_delivery_worker() -> None:
 
 
 def start_image_delivery_workers() -> None:
-    """启动投递 worker（幂等）。维护循环也会调用，用于拉起意外退出的 worker。"""
+    """将投递 worker 补齐至目标数量；可重复调用。
+
+    维护循环与入队路径都会调用本函数，因此必须幂等：仅在数量不足时创建新任务，已存在
+    或正在退出的任务不受影响。
+    """
     while len(_IMAGE_DELIVERY_TASKS) < IMAGE_DELIVERY_WORKERS:
         _IMAGE_DELIVERY_TASKS.append(asyncio.create_task(_image_delivery_worker()))
 
@@ -337,19 +368,29 @@ async def stop_image_delivery_workers() -> None:
 
 
 def _prune_image_delivery_workers() -> None:
-    """丢掉已结束的 worker 并补足数量，避免一次意外让投递能力永久下降。"""
+    """移除已结束的 worker 任务并补足数量。
+
+    worker 因未捕获异常退出时，其任务句柄仍留在表中，若只按数量判断便会误认为投递能力
+    充足，能力将随每次意外单调下降。先剔除已完成任务再补齐，可使该状态自愈。
+    """
     _IMAGE_DELIVERY_TASKS[:] = [task for task in _IMAGE_DELIVERY_TASKS if not task.done()]
     start_image_delivery_workers()
 
 
 def image_delivery_backlog() -> int:
-    """队列积压量（可观测性用）。"""
+    """返回当前队列积压量，供可观测性使用；读取不产生副作用。"""
     return _IMAGE_DELIVERY_QUEUE.qsize()
 
 
 async def _enqueue_image_job(job: _ImageJob) -> bool:
-    """入队并立即返回；队列满时退回「只发文字」，绝不阻塞命令协程。"""
-    # 重载插件不跑 on_core_start_before，新队列没有消费者，图与文字会全部积压
+    """入队后立即返回；队列满时降级为仅发送文字。
+
+    入队必须采用非阻塞写入：一旦在此等待空位，命令协程就会重新占用 Core 的命令并发
+    额度，本次改造的意义随之丧失。队列满意味着下游投递能力已达上限，此时牺牲图片、
+    保证文字可达，是可接受的降级路径。
+    """
+    # 插件重载不会执行 on_core_start_before，队列可能没有消费者而持续积压，
+    # 故在每次入队前自愈式补齐 worker
     _prune_image_delivery_workers()
     try:
         _IMAGE_DELIVERY_QUEUE.put_nowait(job)
@@ -372,7 +413,11 @@ async def _send_role_image(
     is_group: bool = True,
     kind: str = 'wife',
 ) -> None:
-    """投递一次角色图发送；入队后立即返回，真正的下载与发送由后台 worker 完成。"""
+    """投递一次角色图发送：仅完成摘要注入与入队。
+
+    AI 摘要必须在此刻生成：入队后请求上下文即被释放，后台 worker 执行时已无法取得本次
+    抽取的角色与文案。
+    """
     _ai_return_draw(kind, role.name, text)
     await _enqueue_image_job(
         _ImageJob(
@@ -411,7 +456,10 @@ async def _send_loli_result_image(
     is_group: bool,
     kind: str = 'loli',
 ) -> None:
-    """投递一次萝莉/正太图发送（loli 与 shota 共用）。"""
+    """投递一次萝莉／正太图发送；两类角色共用同一实现。
+
+    此处以空 `RoleCandidate` 占位：该路径走 `loli_style` 投递分支，不读取角色信息。
+    """
     _ai_return_draw(kind, '', text)
     await _enqueue_image_job(
         _ImageJob(
@@ -427,7 +475,7 @@ async def _send_loli_result_image(
     )
 
 
-# 正太与萝莉共用同一套投递逻辑
+# 正太与萝莉共用同一套投递逻辑：两者仅取图来源不同，投递路径完全一致
 _send_shota_result_image = _send_loli_result_image
 
 

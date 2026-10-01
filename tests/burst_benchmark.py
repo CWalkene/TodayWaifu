@@ -1,34 +1,34 @@
-"""零点高峰突发压测：在真机 Core 上复现「全员同时抽老婆」。
+"""零点高峰突发压测：在真机 Core 上复现「全员同时抽老婆」的并发链路。
 
-**这个脚本不能在本地跑**，它需要真实的 gsuid_core 环境。用法：
+本脚本依赖真实的 gsuid_core 运行环境，无法在插件仓库内独立执行。用法：
 
     cd <gsuid_core 仓库根>
     .venv/bin/python plugins/TodayWaifu/tests/burst_benchmark.py <plugin_parent_dir> [并发数] [warm] [db]
 
 `plugin_parent_dir` 是**包含** `TodayWaifu` 包的那一层目录（通常是 `plugins/`）。
-可选参数：`warm` 先灌满磁盘缓存（模拟 23:50 预热之后的 00:00）；
-`db` 把真实的一次 `upsert_record` 写库也算进命令路径。
+可选参数：`warm` 先灌满磁盘缓存，以复现 23:50 预热完成之后的 00:00 突发；
+`db` 把真实的一次 `upsert_record` 写库计入命令路径。
 
-它替代了原来的 `peak_benchmark.py` —— 那个只测内存里 `AsyncSourceCache` 的
-并发合并（100 个协程打同一个 key，`loader_calls=1`），根本没有复现零点场景，
-反而给出了「已经优化好了」的错觉。
+它取代了此前的 `peak_benchmark.py`。后者只验证内存中 `AsyncSourceCache` 的并发
+合并（100 个协程请求同一 key，`loader_calls=1`），并未复现零点链路，却输出了
+「问题已优化」的结论，是早期多轮修复未能命中根因的认知来源之一。
 
-测四件事（前两个才是「卡死」的直接原因）：
+压测覆盖四项指标，其中前两项才是命令相互阻塞的直接成因：
 
-  1. `slot_occupancy_*`  命令协程占用 Core `CommandSemaphore` 额度的时长。
-     框架在协程**结束**时才归还额度，所以这个值就是「一条命令会堵住别人多久」。
-  2. `command_slot_wait_*` 一条**无关命令**要等多久才能拿到额度。
-     额度被占满时框架 `_process` 会停止消费队列，该 bot 上所有插件一起卡。
-  3. `competing_probe_*`  别的插件用 `asyncio.to_thread` 做阻塞 IO 要等多久。
-     量化「插件借用了 Core 默认线程池」造成的跨插件饥饿。
-  4. `all_images_delivered_seconds` 用户视角的完成时刻（吞吐），
-     用来确认延迟优化没有以牺牲吞吐为代价。
+  1. `slot_occupancy_*`  命令协程持有 Core `CommandSemaphore` 额度的时长。
+     框架直至协程**结束**才归还额度，故该值等价于「一条命令会阻塞其他命令多久」。
+  2. `command_slot_wait_*` 一条**无关命令**取得额度所需的等待时间。
+     额度耗尽时框架 `_process` 停止消费队列，该 bot 上全部插件一并受阻。
+  3. `competing_probe_*`  其他插件经 `asyncio.to_thread` 执行阻塞 IO 的等待时长，
+     用于量化插件占用 Core 默认线程池所引发的跨插件饥饿。
+  4. `all_images_delivered_seconds` 用户视角的完成时刻（吞吐量），
+     用于确认延迟优化未以牺牲吞吐为代价。
 
-注意：用 `db` 时必须让 `prepare_db()` 复刻框架真实的 SQLite 初始化
-（WAL + `synchronous=NORMAL`）。漏掉会测成 `journal_mode=delete` +
-`synchronous=FULL`，每次提交都 fsync，写入延迟被高估好几倍。
+使用 `db` 时必须让 `prepare_db()` 复刻框架真实的 SQLite 初始化（WAL +
+`synchronous=NORMAL`）。否则实测落在 `journal_mode=delete` + `synchronous=FULL`
+之下，每次提交都触发 fsync，写入延迟被高估数倍。
 
-真机 4 核、200 并发、冷缓存、0.5s/张图库的实测：
+真机 4 核、200 并发、冷缓存、0.5s/张图库的实测基线：
 
     指标                   修复前        修复后       修复后+预热
     命令占用额度 max       2081.6 ms     0.1 ms       0.2 ms
@@ -37,7 +37,7 @@
     其他插件阻塞 IO 等待   493.0 ms      17.9 ms      13.1 ms
     全部 200 张图送达      13.10 s       12.87 s      0.43 s
 
-带上真实写库（`db`）后，剩下的瓶颈是框架的 SQLite 单写者闸门：
+带上真实写库（`db`）后，剩余的瓶颈是框架的 SQLite 单写者闸门：
 
     指标                   修复前        修复后
     命令占用额度 max       2123.9 ms     195.8 ms
@@ -58,8 +58,8 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
 PORT = 8899
-IMAGE_DELAY = 0.5          # 每张图的模拟网络耗时
-COMMAND_SEMAPHORE = 25     # 框架 CommandSemaphore 默认值
+IMAGE_DELAY = 0.5          # 单张图片的模拟网络耗时；须大于零，否则并发争用不可观测
+COMMAND_SEMAPHORE = 25     # 对齐框架 CommandSemaphore 默认值，偏离将改变额度耗尽的临界并发
 COMPETING_PROBE_INTERVAL = 0.05
 
 
@@ -85,7 +85,13 @@ def start_server() -> ThreadingHTTPServer:
 
 
 async def competing_probe(samples: list[float], stop: asyncio.Event) -> None:
-    """模拟「别的插件」用默认 executor 做阻塞 IO，记录它要等多久。"""
+    """以默认 executor 执行阻塞 IO，采样其他插件被线程池饥饿的程度。
+
+    生产环境中插件与框架共用 Core 的默认线程池，图片下载长期占用该池时，
+    其他插件的同步 IO 只能排在其后；该采样是本插件对跨插件可用性影响的观测口径。
+
+    探针以固定间隔循环，故采样值上升直接对应线程池排队，而非探针自身开销。
+    """
     while not stop.is_set():
         started = time.perf_counter()
         await asyncio.to_thread(time.sleep, 0.01)
@@ -94,7 +100,13 @@ async def competing_probe(samples: list[float], stop: asyncio.Event) -> None:
 
 
 async def command_slot_probe(waits: list[float], stop: asyncio.Event, sem: asyncio.Semaphore) -> None:
-    """模拟「一条无关命令」要等多久才能拿到 Core 的命令并发额度。"""
+    """采样一条无关命令取得 Core 命令并发额度的等待时长。
+
+    额度被占满时框架 `_process` 会停止消费队列，因此该等待时长反映的是该 bot 上
+    所有插件的可用性，而非本插件自身的命令延迟；这是判断「是否会导致整个 Core 阻塞」的依据。
+
+    探针与压测协程共用同一个信号量，从而与真实命令争抢同一份额度。
+    """
     while not stop.is_set():
         started = time.perf_counter()
         async with sem:
@@ -111,10 +123,10 @@ def percentile(values: list[float], ratio: float) -> float:
 
 
 async def prepare_db() -> object:
-    """把框架的数据库层指向一个临时 SQLite，建好 dailywiferecord 表。
+    """把框架的数据库层指向临时 SQLite，并建好 dailywiferecord 表。
 
-    GsCore 默认 db_type 就是 SQLite，且所有写都要排一个**进程级单写者闸门**，
-    所以命令路径里的那次 upsert 必须一起压。
+    GsCore 默认 `db_type` 即为 SQLite，且所有写入都要排一个**进程级单写者闸门**，
+    因此命令路径中的那次 upsert 必须一并压测；若绕过数据库，占用额度的时长会被低估。
     """
     from sqlmodel import SQLModel
     from sqlalchemy import event
@@ -124,9 +136,9 @@ async def prepare_db() -> object:
     from gsuid_core.utils.database import base_models as BM
 
     db_path = Path(tempfile.mkdtemp()) / 'bench.db'
-    # 必须复刻框架真实的 SQLite 初始化（base_models.py:165-226）：
-    # WAL + synchronous=NORMAL。漏掉的话测到的是 journal_mode=delete +
-    # synchronous=FULL（每次提交都 fsync），会把写入延迟高估好几倍。
+    # 必须复刻框架真实的 SQLite 初始化（base_models.py:165-226）：WAL + synchronous=NORMAL。
+    # 仅创建引擎而不复现该步骤时，实测落在 journal_mode=delete + synchronous=FULL 之下，
+    # 每次提交都触发 fsync，写入延迟被高估数倍，据此得出的结论会失真。
     BM._enable_sqlite_wal(str(db_path))
     engine = create_async_engine(f'sqlite+aiosqlite:///{db_path}')
     event.listens_for(engine.sync_engine, 'connect')(BM._set_sqlite_connect_pragmas)
@@ -151,7 +163,8 @@ async def run(n_draws: int, plugin_parent: str, warm: bool = False, with_db: boo
     G._gallery_api_url = lambda: f'http://127.0.0.1:{PORT}/api/roles'
     S._download_image = G._download_image
 
-    # 生产环境由 on_core_start_before 钩子启动投递 worker；基准里手动启动
+    # 生产环境由 on_core_start_before 钩子启动投递 worker；压测进程没有该钩子，
+    # 且发图链路已改为后台 worker 投递，故需在此手动补启动，否则送达时刻永远等不到。
     has_workers = hasattr(S, 'start_image_delivery_workers')
     if has_workers:
         S.start_image_delivery_workers()
@@ -184,7 +197,8 @@ async def run(n_draws: int, plugin_parent: str, warm: bool = False, with_db: boo
     ]
 
     if warm:
-        # 模拟 23:50 的预热：先把图片灌进磁盘缓存，再看 00:00 的突发
+        # 复现 23:50 预热完成之后的 00:00：先把图片写入磁盘缓存，使突发阶段
+        # 只度量命中路径；预热耗时不计入任何指标，避免与冷缓存口径混淆。
         async def warm_one(url: str) -> None:
             try:
                 await G._download_image(url)
@@ -194,7 +208,8 @@ async def run(n_draws: int, plugin_parent: str, warm: bool = False, with_db: boo
         await asyncio.gather(*(warm_one(u) for u in urls))
         print(f'# 预热完成，缓存文件 {len(list(cache_root.iterdir()))} 个', file=sys.stderr)
 
-    # 默认 executor 压到真实机器的线程数（min(32, cpu+4)），模拟生产 Core
+    # 默认 executor 容量对齐真实机器（min(32, cpu+4)）：线程数放宽会掩盖线程池饥饿，
+    # 收窄则会把本机 CPU 数量误当成框架缺陷。
     loop = asyncio.get_running_loop()
     workers = min(32, (len(__import__('os').sched_getaffinity(0)) or 1) + 4)
     loop.set_default_executor(ThreadPoolExecutor(max_workers=workers))
@@ -208,8 +223,9 @@ async def run(n_draws: int, plugin_parent: str, warm: bool = False, with_db: boo
 
     async def draw(index: int) -> None:
         started = time.perf_counter()
-        async with sem:                       # 命令协程占用 Core 并发额度
-            # 进入临界区之后才是「命令真正占用额度」的时长 —— 这才是拖死 Core 的量
+        async with sem:                       # 命令协程在此持有 Core 的并发额度
+            # 自进入临界区起计时：持锁时长决定其他命令的排队深度，是 Core 过载的直接度量；
+            # 包含额度等待的外层耗时只反映本命令的用户体验，两者不可混用。
             entered = time.perf_counter()
             if with_db:
                 await store._save_daily_record(events[index], 'wives', f'u{index}', record_value)
@@ -229,8 +245,8 @@ async def run(n_draws: int, plugin_parent: str, warm: bool = False, with_db: boo
     stop.set()
     await asyncio.gather(probe_a, probe_b, return_exceptions=True)
 
-    # 等**所有图片真正发出去**（旧代码是内联发送，新代码由后台 worker 发送），
-    # 这是用户视角的完成时刻，也是唯一公平的跨版本比较口径
+    # 等待**全部图片真正送达**：内联发送与后台 worker 发送的命令协程结束时刻不同，
+    # 唯有用户视角的完成时刻可跨版本比较；180s 上限用于避免投递回归时压测永久挂起。
     while len(sent) < n_draws and time.perf_counter() - started < 180:
         await asyncio.sleep(0.05)
     deliver_seconds = time.perf_counter() - started

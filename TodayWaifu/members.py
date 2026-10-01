@@ -1,4 +1,9 @@
-"""TodayWaifu 的群成员目录、头像与显示名。"""
+"""TodayWaifu 的群成员目录、头像与显示名。
+
+成员相关数据分布在两处：GsCore 的 CoreUser 表提供群成员缓存，头像需要按需下载到本地。
+两者都有时效性且获取成本不低（一次数据库查询 / 一次网络请求），因此分别经有界缓存与
+在途合并表收敛，避免同一群、同一成员被并发重复读取。
+"""
 from __future__ import annotations
 
 import re
@@ -23,15 +28,21 @@ from .constants import LOG_PREFIX, MEMBER_AVATAR_CACHE_SECONDS, _cfg_bool, _cfg_
 
 
 def _valid_display_name(value: object, user_id: str | int | None = None) -> str:
+    # 上游写入的占位值多种多样（Python 的 None、字符串 "None"、数据库 NULL 字面量、
+    # 甚至直接用数字 1 兜底），逐项排除而非只判空：这些值一旦进入展示文案，
+    # 用户会看到「今天的老婆是 None」。
     text = str(value or '').strip()
     if text in {'', '1', 'None', 'none', 'NULL', 'null'}:
         return ''
+    # 显示名等于用户 ID 时视为没有昵称，交由调用方回落到 ID，避免文案重复两次。
     if user_id is not None and text == str(user_id):
         return ''
     return text
 
 
 def _display_name_from_mapping(data: object, user_id: str | int | None = None) -> str:
+    # 按优先级探测字段名而不是固定取一个：不同适配器对昵称的命名不统一
+    #（群名片 / 昵称 / 用户名），此处按语义由具体到宽泛依次回退。
     if not isinstance(data, dict):
         return ''
     for field in ('card', 'nickname', 'name', 'username', 'user_name'):
@@ -42,6 +53,9 @@ def _display_name_from_mapping(data: object, user_id: str | int | None = None) -
 
 
 def _user_display_name(ev: Event, user_id: str | int | None = None) -> str:
+    # 事件自带的发送者信息比数据库更新（用户刚改群名片时数据库尚未同步），
+    # 因此查询目标就是发送者本人时优先用事件数据；查他人时没有事件上下文，
+    # 只能回落到用户键。
     key = _user_key(ev, user_id)
     if user_id is None or key == str(ev.user_id):
         value = _display_name_from_mapping(ev.sender or {}, key)
@@ -51,18 +65,24 @@ def _user_display_name(ev: Event, user_id: str | int | None = None) -> str:
 
 
 async def _load_group_display_names(ev: Event) -> dict[str, str]:
+    # 非群聊没有成员名单，返回空表而非报错，使调用方统一走「无显示名」分支。
     if not ev.group_id:
         return {}
 
+    # 缓存键只含 bot_id 与 group_id，不含发起请求的用户：成员名单是群级数据，
+    # 按用户区分缓存只会重复查询同一份名单。
     cache_key = f'{ev.bot_id}:{ev.group_id}'
 
     async def load_names() -> dict[str, str]:
         try:
             users = await CoreUser.get_group_all_user(str(ev.group_id))
         except SQLAlchemyError as exc:
+            # 数据库异常降级为空表：显示名只是文案修饰，不值得让整条抽卡流程失败。
             logger.warning(f'{LOG_PREFIX} 读取 GsCore 群成员缓存失败: {exc}')
             return {}
 
+        # 同一用户可能在多个 bot_id 下各有一行（多适配器接入同一群）。优先取当前
+        # 真实 bot 的行，使显示名与用户实际看到的来源一致；取不到再退到任意一行。
         preferred_bot_id = str(ev.real_bot_id or ev.bot_id or '').strip()
         exact: dict[str, str] = {}
         fallback: dict[str, str] = {}
@@ -76,12 +96,16 @@ async def _load_group_display_names(ev: Event) -> dict[str, str]:
                 if preferred_bot_id and str(user.bot_id or '').strip() == preferred_bot_id:
                     exact[user_id] = name
         logger.debug(f'{LOG_PREFIX} 成功加载群 {ev.group_id} 的成员显示名称')
+        # 只有当精确匹配确实命中时才采用它：exact 为空说明没有该 bot 的行，
+        # 此时回退结果比空表更有用。
         return exact or fallback
 
     return await _GROUP_DISPLAY_NAME_CACHE.get(cache_key, load_names)
 
 
 def _member_feature_enabled() -> bool:
+    # 默认关闭：群友模式会读取整群名单并对随机成员发起网络请求，属于需要用户明确
+    # 同意的行为，不应在未配置时自动生效。
     return _cfg_bool('DailyWifeEnableGroupMember', False)
 
 
@@ -90,10 +114,13 @@ def _marry_member_enabled() -> bool:
 
 
 def _member_probability() -> float:
+    # 默认 0.1 是概率而非开关：群友只是抽卡的补充结果，过高会挤占角色图库的出场机会。
     return _cfg_probability('DailyWifeGroupMemberProbability', 0.1)
 
 
 def _valid_member_text(value: object) -> str:
+    # 与显示名校验共用同一组占位值，但不排除与用户 ID 相同的情况：
+    # 头像来源本身就是 ID 或 URL，此处只负责剔除无效值。
     text = str(value or '').strip()
     if text in {'', '1', 'None', 'none', 'NULL', 'null'}:
         return ''
@@ -105,12 +132,15 @@ def _qq_avatar_url(user_id: str) -> str:
 
 
 def _member_avatar_cache_path(user_id: str) -> Path:
+    # 用户 ID 来自平台，直接参与拼接路径存在目录穿越风险；此处只保留安全字符集，
+    # 其余一律替换为下划线，使生成的文件名必定落在缓存目录内。
     safe_user_id = re.sub(r'[^0-9A-Za-z_-]+', '_', str(user_id)) or 'unknown'
     return _custom_upload_data_root() / 'group_member_avatar_cache' / f'{safe_user_id}.jpg'
 
 
 def _usable_cached_avatar(path: Path, check_ttl: bool = True) -> bool:
     try:
+        # 零字节文件通常来自上次写盘中断，视为不可用，否则会把空文件当成头像发出去。
         if not path.is_file() or path.stat().st_size <= 0:
             return False
         if check_ttl and time.time() - path.stat().st_mtime > MEMBER_AVATAR_CACHE_SECONDS:
@@ -118,6 +148,7 @@ def _usable_cached_avatar(path: Path, check_ttl: bool = True) -> bool:
             return False
         return True
     except OSError:
+        # 并发删除或权限问题下 stat 可能失败，按不可用处理而不中断流程。
         return False
 
 
@@ -126,22 +157,29 @@ def _download_avatar(url: str, path: Path) -> bool:
         logger.debug(f'{LOG_PREFIX} 开始下载头像: {url} -> {path}')
         path.parent.mkdir(parents=True, exist_ok=True)
         request = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        # 8 秒超时：头像属于可选素材，长时间阻塞会拖慢整个群友抽取流程。
         with urlopen(request, timeout=8) as response:
+            # 多读 1 字节用于判定是否超限，避免把超大响应整个载入内存。
             data = response.read(2 * 1024 * 1024 + 1)
         if not data or len(data) > 2 * 1024 * 1024:
             logger.warning(f'{LOG_PREFIX} 下载头像数据无效或体积过大: {url}')
             return False
+        # 先写临时文件再原子替换：并发读方不会读到只写了一半的图片。
         tmp_path = path.with_suffix('.tmp')
         tmp_path.write_bytes(data)
         tmp_path.replace(path)
         logger.debug(f'{LOG_PREFIX} 头像下载完成: {path}')
         return True
     except (OSError, HTTPError, URLError, TimeoutError) as exc:
+        # 网络与磁盘异常一律降级为失败：调用方会继续尝试其它候选，不需要异常穿透。
         logger.warning(f'{LOG_PREFIX} 下载群友头像失败: {url} -> {exc}')
         return False
 
 
 def _resolve_member_avatar(user_id: str, avatar_source: str) -> str:
+    # 解析顺序为「新鲜缓存 → 平台给出 http 头像 → 本地路径 → QQ 头像接口 →
+    # 过期缓存」。把平台来源排在 QQ 接口之前，是因为前者来自当前平台、与用户实际
+    # 形象一致；最后仍允许使用过期缓存，使离线或接口限流时至少还有图可发。
     cache_path = _member_avatar_cache_path(user_id)
     if _usable_cached_avatar(cache_path):
         return str(cache_path)
@@ -154,6 +192,7 @@ def _resolve_member_avatar(user_id: str, avatar_source: str) -> str:
         try:
             local_path = Path(source)
             if local_path.is_file():
+                # 本地路径直接返回，不复制到缓存：调用方只读取，无需二次占用磁盘。
                 return str(local_path)
         except (OSError, ValueError):
             logger.debug(f'{LOG_PREFIX} 头像本地路径无效: {source}')
@@ -161,6 +200,8 @@ def _resolve_member_avatar(user_id: str, avatar_source: str) -> str:
     if str(user_id).isdigit() and _download_avatar(_qq_avatar_url(str(user_id)), cache_path):
         return str(cache_path)
 
+    # 过期缓存作为最后兜底，仅在前面全部失败时使用；check_ttl=False 只跳过时效判断，
+    # 空文件仍会被拒绝。
     if _usable_cached_avatar(cache_path, check_ttl=False):
         return str(cache_path)
     return ''
@@ -179,6 +220,9 @@ async def _load_group_member_candidates(ev: Event) -> tuple[MemberCandidate, ...
             logger.warning(f'{LOG_PREFIX} 读取 GsCore 群成员缓存失败: {exc}')
             return ()
 
+        # 收集所有可能是机器人自身的 ID：不同适配器分别填写 bot_id / real_bot_id /
+        # bot_self_id，任何一个都可能是该群里的机器人账号。三者全部排除，
+        # 否则用户可能抽到自己或机器人。
         bot_ids = {
             str(item).strip()
             for item in (
@@ -198,6 +242,7 @@ async def _load_group_member_candidates(ev: Event) -> tuple[MemberCandidate, ...
             if not user_id or user_id in excluded_user_ids:
                 continue
             # CoreUser 的展示名列固定为 user_name（不存在 nickname/name/username 列）
+            # 取不到显示名时用 ID 兜底：成员记录即便没有昵称也应可被抽中。
             name = _valid_display_name(user.user_name, user_id) or user_id
             avatar = _valid_member_text(user.user_icon)
             candidate = MemberCandidate(name=name, user_id=user_id, avatar=avatar)
@@ -207,12 +252,16 @@ async def _load_group_member_candidates(ev: Event) -> tuple[MemberCandidate, ...
 
         result = exact or fallback
         logger.debug(f'{LOG_PREFIX} 获取到 {len(result)} 个群友候选对象')
+        # 按名称与 ID 排序固定顺序：随机抽取随后会在此基础上打乱，
+        # 若输入顺序本身不稳定，同一用户当天的结果将无法复现。
         return tuple(sorted(result.values(), key=lambda item: (item.name, item.user_id)))
 
     return await _MEMBER_CACHE.get(cache_key, load_members)
 
 
 async def _resolve_member_candidate_avatar(member: MemberCandidate) -> MemberCandidate | None:
+    # 按用户 ID 合并在途任务：同一成员可能被多个并发命令同时抽到，
+    # 共享一次下载即可，否则会重复占用网络与线程池。
     task = _MEMBER_AVATAR_INFLIGHT.get(member.user_id)
     if task is None:
         task = asyncio.create_task(
@@ -222,9 +271,11 @@ async def _resolve_member_candidate_avatar(member: MemberCandidate) -> MemberCan
     try:
         avatar = await task
     finally:
+        # 仅在任务已结束且仍是当前项时移除，避免覆盖掉后来者登记的新任务。
         if task.done() and _MEMBER_AVATAR_INFLIGHT.get(member.user_id) is task:
             _MEMBER_AVATAR_INFLIGHT.pop(member.user_id, None)
     if not avatar:
+        # 无头像的候选直接丢弃：结果图片缺少人像会呈现为空位，弱于换一个候选。
         return None
     return MemberCandidate(member.name, member.user_id, avatar)
 
@@ -238,6 +289,8 @@ async def _pick_group_member(
     if not candidates:
         return None
 
+    # 排除发起者本人与机器人自身；显式传入 exclude_user_id 时以它为准，
+    # 用于代替他人抽卡（如管理员代抽）时仍需排除被代替的用户。
     target_user_id = str(exclude_user_id if exclude_user_id is not None else ev.user_id).strip()
     exclude_ids = {target_user_id}
     bot_self_id = str(ev.bot_self_id or '').strip()
@@ -249,12 +302,15 @@ async def _pick_group_member(
         logger.warning(f'{LOG_PREFIX} 过滤自身及Bot后无可用群友候选')
         return None
 
+    # 先打乱再逐个尝试头像：任何候选都可能因网络原因取不到头像，
+    # 打乱保证回退顺序与名单顺序无关，不会总是固定落到同一个人。
     rng.shuffle(candidates)
     for member in candidates:
         resolved = await _resolve_member_candidate_avatar(member)
         if resolved is not None:
             logger.debug(f'{LOG_PREFIX} 成功挑选群友: {resolved.name} ({resolved.user_id})')
             return resolved
+    # 全部候选均无有效头像时返回 None，由调用方决定是否回落到角色图库。
     logger.warning(f'{LOG_PREFIX} 未能成功获取任一群友的有效头像')
     return None
 
@@ -264,6 +320,7 @@ async def _roll_group_member_wife(
     user_id: str | int | None = None,
     rng: random.Random | None = None,
 ) -> WifeRecord | None:
+    # 逐层短路：功能未开启、非群聊、概率为 0 时都不需要读取成员名单。
     if not _member_feature_enabled() or not ev.group_id:
         return None
 
@@ -272,6 +329,8 @@ async def _roll_group_member_wife(
         return None
 
     key = _user_key(ev, user_id)
+    # 检定与挑选使用两个独立的随机源：若共用同一个实例，检定消耗的随机数会影响
+    # 挑选结果，使同一天同一用户在不同调用次数下得到不同群友。
     hit_rng = rng or _daily_rng(ev, key, 'group_member_probability')
     rolled_prob = hit_rng.random()
     if rolled_prob >= probability:

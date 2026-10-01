@@ -1,4 +1,12 @@
-"""熔断器与重试策略：图库挂掉时不能再让每个用户都打满重试链。"""
+"""图库熔断与重试参数的回归测试：上游抖动不得放大为插件侧的请求风暴。
+
+提交 c07ca0c 之前，`_http_get_with_retry` 使用 retries=3、固定 5 秒间隔、timeout=20，
+单次失败被放大为 4 倍请求量与最坏 95 秒的线程占用。图库一旦抖动，每个用户的抽签都会
+继续向已过载的上游补刀，插件线程池同时被长时间占满，表现为整个零点高峰卡顿。
+
+本文件守护由此引入的合约：连续失败达阈值即熔断并按主机隔离，冷却结束仅放行一个探测
+请求且探测失败立即重新熔断；认证与限流类错误属于客户端侧条件，须直接抛出而不计入熔断。
+"""
 import ast
 import sys
 import unittest
@@ -11,6 +19,7 @@ PLUGIN = ROOT / 'TodayWaifu'
 
 
 def _load(name: str, filename: str):
+    # 独立模块名加载插件源码：避免同名模块在 sys.modules 中被复用而掩盖真实加载结果
     spec = importlib.util.spec_from_file_location(name, PLUGIN / filename)
     if spec is None or spec.loader is None:
         raise RuntimeError(f'cannot load {filename}')
@@ -24,6 +33,8 @@ breaker_module = _load('todaywaifu_circuit_breaker', 'circuit_breaker.py')
 CircuitBreaker = breaker_module.CircuitBreaker
 
 
+# 可手动推进的单调时钟替身：熔断器的时间来源以参数注入，测试因此无需真实等待冷却
+# 时间即可覆盖半开窗口，判定结果也不受真实时间流逝影响
 class _FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -41,6 +52,7 @@ class CircuitBreakerTests(unittest.TestCase):
         return CircuitBreaker(failure_threshold=threshold, cooldown_seconds=cooldown, clock=clock), clock
 
     def test_stays_closed_below_threshold(self) -> None:
+        # 阈值下必须保持闭合：过早熔断会让偶发抖动直接升级为全量回退本地图库
         breaker, _ = self._breaker(threshold=3)
         for _ in range(2):
             breaker.record_failure('gallery.test')
@@ -52,10 +64,12 @@ class CircuitBreakerTests(unittest.TestCase):
         for _ in range(3):
             breaker.record_failure('gallery.test')
 
+        # 达到阈值即刻进入冷却，冷却期内不得再向上游发起任何请求
         self.assertTrue(breaker.is_open('gallery.test'))
         self.assertFalse(breaker.allow('gallery.test'))
         self.assertAlmostEqual(breaker.retry_after('gallery.test'), 30.0, places=3)
 
+        # 边界取冷却结束前 1 秒：判定必须是「未到期」而非提前放行
         clock.advance(29.0)
         self.assertFalse(breaker.allow('gallery.test'))
 
@@ -63,6 +77,8 @@ class CircuitBreakerTests(unittest.TestCase):
         self.assertTrue(breaker.allow('gallery.test'), '冷却结束后必须放行一个探测请求')
 
     def test_success_closes_the_circuit(self) -> None:
+        # 一次成功即视为上游恢复并复位计数：若继续累积旧的失败次数，恢复后的首个
+        # 抖动会立刻再次熔断
         breaker, _ = self._breaker(threshold=3)
         for _ in range(3):
             breaker.record_failure('gallery.test')
@@ -76,12 +92,15 @@ class CircuitBreakerTests(unittest.TestCase):
         for _ in range(3):
             breaker.record_failure('gallery.test')
         clock.advance(31.0)
+        # 探测请求是冷却结束后恢复判定的唯一采样点，其行踪必须被计入
         self.assertTrue(breaker.allow('gallery.test'))
 
         breaker.record_failure('gallery.test')
         self.assertTrue(breaker.is_open('gallery.test'), '探测失败应立即重新熔断')
 
     def test_breakers_are_isolated_per_host(self) -> None:
+        # 按主机隔离的意义在于故障不外溢：图库不可用不应牵连萝莉接口、头像下载等
+        # 其它主机上的请求
         breaker, _ = self._breaker(threshold=2)
         breaker.record_failure('a.test')
         breaker.record_failure('a.test')
@@ -90,12 +109,15 @@ class CircuitBreakerTests(unittest.TestCase):
         self.assertTrue(breaker.allow('b.test'), '一个主机熔断不能影响其它主机')
 
     def test_unknown_key_is_allowed_and_has_no_side_effects(self) -> None:
+        # 查询未知主机不得为其创建状态：否则单纯观测就会让状态表随主机数无限增长
         breaker, _ = self._breaker()
         self.assertTrue(breaker.allow('never-seen.test'))
         self.assertTrue(breaker.allow('never-seen.test'))
         self.assertEqual(breaker.retry_after('never-seen.test'), 0.0)
 
     def test_is_open_is_a_pure_query(self) -> None:
+        # 观测接口不得产生副作用：若 is_open 也消耗半开机会，指标采集与日志打印就会
+        # 悄悄吃掉本应留给真实请求的探测名额
         breaker, clock = self._breaker(threshold=1, cooldown=10.0)
         breaker.record_failure('a.test')
         clock.advance(11.0)
@@ -104,6 +126,7 @@ class CircuitBreakerTests(unittest.TestCase):
         self.assertTrue(breaker.allow('a.test'))
 
     def test_reset_clears_every_host(self) -> None:
+        # 全量复位用于配置热重载与人工恢复：遗漏主机将使其保持熔断且无其它解除途径
         breaker, _ = self._breaker(threshold=1)
         breaker.record_failure('a.test')
         breaker.reset()
@@ -116,6 +139,7 @@ def _gallery_tree() -> ast.Module:
 
 class RetryPolicyTests(unittest.TestCase):
     def test_retry_count_is_reduced_to_one(self) -> None:
+        # 以 AST 取值而非导入常量：constants.py 依赖包内相对导入，直接导入会失败
         constants = (PLUGIN / 'constants.py').read_text(encoding='utf-8')
         tree = ast.parse(constants)
         values = {
@@ -142,6 +166,7 @@ class RetryPolicyTests(unittest.TestCase):
             and isinstance(node.targets[0], ast.Name)
             and isinstance(node.value, ast.Constant)
         }
+        # 该上界是线程池占用的直接来源：任一参数被调大都会线性抬高单次请求的持锁时长
         retries = values['HTTP_RETRIES']
         worst = (retries + 1) * values['IMAGE_HTTP_TIMEOUT_SECONDS']
         worst += retries * (values['RETRY_MAX_DELAY_SECONDS'] + values['RETRY_JITTER_SECONDS'])
@@ -152,6 +177,8 @@ class RetryPolicyTests(unittest.TestCase):
         helper = source[
             source.index('def _http_get_with_retry('):source.index('def _fetch_gallery_payload_sync(')
         ]
+        # 熔断器只有在请求前后都被调用才生效：缺 allow 等于没有闸门，缺 record_* 则
+        # 永远无法触发熔断
         self.assertIn('_HTTP_BREAKER.allow(key)', helper)
         self.assertIn('_HTTP_BREAKER.record_failure(key)', helper)
         self.assertIn('_HTTP_BREAKER.record_success(key)', helper)
@@ -161,6 +188,7 @@ class RetryPolicyTests(unittest.TestCase):
     def test_retry_delay_uses_exponential_backoff_with_jitter(self) -> None:
         source = (PLUGIN / 'gallery.py').read_text(encoding='utf-8')
         fn = source[source.index('def _retry_delay('):source.index('def _http_get_with_retry(')]
+        # 指数退避拉开重试间隔，抖动打散同时重试的请求；封顶则防止退避时间失控
         self.assertIn('2 ** attempt', fn)
         self.assertIn('random.uniform', fn)
         self.assertIn('min(base, RETRY_MAX_DELAY_SECONDS)', fn)
@@ -176,6 +204,7 @@ class RetryPolicyTests(unittest.TestCase):
         helper = source[
             source.index('def _http_get_with_retry('):source.index('def _fetch_gallery_payload_sync(')
         ]
+        # 截断到分支起始处做局部匹配：源码扫描需限定在该分支内，避免匹配到文件其它位置
         marker = 'if exc.code in {401, 403, 429}:'
         self.assertIn(marker, helper, '认证/限流错误必须走直接抛出分支')
         auth_branch = helper[helper.index(marker):]

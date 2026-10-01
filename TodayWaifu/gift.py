@@ -1,4 +1,11 @@
-"""TodayWaifu gift command."""
+"""TodayWaifu gift command.
+
+赠送需要对方确认，因此「发起」与「接受」之间存在最长 60 秒的窗口。这段时间内赠送方
+的对象可能被抢、被转送或已离婚，所以发起时的校验结论不能作为写入依据——接受方必须
+在持锁状态下重新校验赠送方与接受方的状态，再决定是否落盘。本模块按该原则划分：
+发起阶段只做即时反馈与登记待确认项，真正的状态判定与写入全部集中在 ``_accept_gift_daily``
+的临界区内。
+"""
 from __future__ import annotations
 
 import time
@@ -36,21 +43,32 @@ from .shared import (
 )
 from .payloads import PendingGift
 
+# 确认窗口与容量上限共同界定待确认表的行为：超时未确认自动作废，容量满时淘汰最早登记项。
+# 时限不设得更长是因为窗口越长，接受时状态已改变（被抢/被送/已离婚）的概率越高，
+# 用户越容易在点确认时收到「赠送已失效」。
 GIFT_CONFIRM_TIMEOUT_SECONDS = 60
+# 容量按会话数估算：每个会话同时最多存在少量待确认项，4096 足以覆盖，同时防止
+# 异常刷屏（反复 @ 不同用户）使内存无界增长。淘汰最早项可能让个别用户的请求提前失效，
+# 但优于内存持续膨胀。
 GIFT_PENDING_MAX_ENTRIES = 4096
+# 待确认项仅存于内存：进程重启后全部失效，用户重新发起即可，无需持久化。
 _GIFT_PENDING: dict[str, PendingGift] = {}
 
 
 def _gift_enabled(kind: str) -> bool:
+    # 默认开启，与开关项的语义保持一致：仅在配置显式关闭时才拦截。
     return _cfg_bool(_daily_kind_metadata(kind).gift_enabled_key, True)
 
 
 def _gift_success_template(kind: str) -> str:
+    # 配置为空串或 None 时回落到内置默认文案：用户清空配置项不应导致成功提示为空。
     metadata = _daily_kind_metadata(kind)
     return str(_cfg(metadata.gift_success_key) or metadata.gift_success_default)
 
 
 def _build_gift_success_text(role: RoleCandidate, target_user_id: str, kind: str) -> str:
+    # 模板占位符由配置决定，此处一次性补齐全部可用字段；多传的键不会影响 format，
+    # 从而让用户自定义模板时无需关心本函数提供了哪些字段。
     template = _gift_success_template(kind)
     return template.format(
         name=role.name,
@@ -60,6 +78,8 @@ def _build_gift_success_text(role: RoleCandidate, target_user_id: str, kind: str
 
 
 def _gift_pending_key(ev: Event, target_user_id: str, kind: str = 'wife') -> str:
+    # 键包含会话、类型与目标用户三者：同一会话内不同类型的赠送、以及针对不同对象的
+    # 赠送是彼此独立的待确认项，必须能同时存在而不互相覆盖。
     return f'{_context_key(ev)}:{kind}:{target_user_id}'
 
 
@@ -72,18 +92,22 @@ async def _send_gift_result_image(
     is_group: bool,
     kind: str,
 ) -> None:
+    # 复用每日结果的图片渲染路径，使赠送成功图与抽卡结果图样式一致。
     await _send_daily_result_image(bot, role, image, text, user_id, is_group, kind)
 
 
 def _get_pending_gift(ev: Event, target_user_id: str, kind: str = 'wife') -> PendingGift | None:
     key = _gift_pending_key(ev, target_user_id, kind)
     pending = _GIFT_PENDING.get(key)
+    # 非字典值说明该键被外部写入了非预期结构（如测试夹具），按不存在处理而非抛出。
     if not isinstance(pending, dict):
         return None
     try:
         created_at = float(pending.get('created_at') or 0)
     except (TypeError, ValueError):
         created_at = 0
+    # 超时项在读取路径上就地移除，而非等待定时清理：由读取方承担惰性回收，
+    # 可确保过期请求在任何时刻都无法被接受，即便清理协程尚未运行。
     if time.time() - created_at > GIFT_CONFIRM_TIMEOUT_SECONDS:
         _GIFT_PENDING.pop(key, None)
         return None
@@ -91,7 +115,11 @@ def _get_pending_gift(ev: Event, target_user_id: str, kind: str = 'wife') -> Pen
 
 
 def _set_pending_gift(ev: Event, target_user_id: str, giver_id: str, kind: str = 'wife') -> None:
+    # 写入前先清理过期项：容量统计基于当前表长，不清理会把已失效的条目算进去，
+    # 导致仍在有效期内的请求被提前淘汰。
     clear_expired_pending_gifts()
+    # 达到上限时淘汰 created_at 最小者。这里按值扫描而非依赖插入顺序，
+    # 因为过期清理与覆盖写入都会打乱 FIFO 语义，按时间取最旧才符合预期。
     if len(_GIFT_PENDING) >= GIFT_PENDING_MAX_ENTRIES:
         oldest_key = min(
             _GIFT_PENDING,
@@ -110,6 +138,7 @@ def _clear_pending_gift(ev: Event, target_user_id: str, kind: str = 'wife') -> N
 
 
 def clear_expired_pending_gifts() -> None:
+    # 遍历前先固化键集合：遍历过程中会删除元素，直接迭代原字典会触发运行时错误。
     now = time.time()
     for key, pending in tuple(_GIFT_PENDING.items()):
         if not isinstance(pending, dict):
@@ -124,19 +153,29 @@ def clear_expired_pending_gifts() -> None:
 
 
 def clear_pending_gifts_for_user(ev: Event, user_id: str) -> None:
-    """取消当前会话中该用户作为赠送方或接收方的全部待确认请求。"""
+    """取消当前会话中该用户作为赠送方或接收方的全部待确认请求。
+
+    用户退出关系、被抢或执行其它会使赠送前提失效的操作时调用：待确认项在前置条件
+    已不成立后仍被接受，会造成「记录被抢走却又被送出」的重复状态，因此必须主动撤销。
+
+    只清理当前会话：待确认键以会话为前缀，跨会话的赠送本就互不可见。
+    """
     context_prefix = f'{_context_key(ev)}:'
     for key, pending in tuple(_GIFT_PENDING.items()):
         if not key.startswith(context_prefix):
             continue
+        # 键的最后一段是目标用户，据此判断接收方身份；赠送方则存在值里。
         is_recipient = key.rsplit(':', 1)[-1] == user_id
         is_giver = isinstance(pending, dict) and str(pending.get('giver_id') or '') == user_id
         if is_recipient or is_giver:
             _GIFT_PENDING.pop(key, None)
 
 
+
 async def _send_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
     title = _daily_item_title(kind)
+    # 功能状态在入口处先行判定：后续步骤会读取上下文并可能登记待确认项，
+    # 未开启的能力不应产生任何副作用。
     if kind == 'husband' and not _husband_available():
         return
     if not _gift_enabled(kind):
@@ -152,6 +191,8 @@ async def _send_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
         )
 
     giver_id = _user_key(ev)
+    # 自送必须先于状态检查拦截：否则会登记一个永远无法被接受的待确认项，
+    # 并占用该用户在这 60 秒内的赠送名额。
     if target_user_id == giver_id:
         return await _safe_send(bot, f'不能把{title}送给自己哦！')
 
@@ -159,6 +200,8 @@ async def _send_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
     if giver_record is None:
         return await _safe_send(bot, f'你今天还没有{title}，先去抽一个吧~')
 
+    # 以下校验均为即时反馈，仅用于尽早告知用户不可赠送；写入前会在接受阶段重新校验，
+    # 因此这里读到的状态即便随后失效也不会产生错误的落盘结果。
     context = await _load_daily_context(ev)
     bucket = _daily_bucket_name(kind)
     giver_data = context[bucket].get(giver_id)
@@ -170,13 +213,17 @@ async def _send_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
         return await _safe_send(bot, f'你今天已经把{title}送出去了~')
     if state == 'divorced':
         return await _safe_send(bot, f'你今天已经和{title}离婚了，没有{title}可以送了~')
+    # 抢来或别人送的记录不再允许转送，防止同一对象在用户之间被无限接力。
     if _is_secondhand_wife(giver_data):
         return await _safe_send(bot, f'这个{title}是抢来或别人送的，不能再送出去哦~')
 
     target_key = _user_key(ev, target_user_id)
+    # 对方已有对象时直接拒绝：接受阶段还会再判一次，此处拦截可避免无谓的等待确认。
     if _has_active_wife(context[bucket].get(target_key)):
         return await _safe_send(bot, f'对方今天已经有{title}了，不需要你送哦~')
 
+    # 同一目标只允许存在一个待确认请求：并发登记会让先到的请求被后到的覆盖，
+    # 用户点确认时依据的可能是较晚那次的内容。
     if _get_pending_gift(ev, target_user_id, kind) is not None:
         return await _safe_send(
             bot,
@@ -186,6 +233,7 @@ async def _send_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
     _set_pending_gift(ev, target_user_id, giver_id, kind)
     giver_name = _user_display_name(ev, giver_id)
     role = giver_record.to_role()
+    # 实际展示的赠送对象文案按类型区分：萝莉不暴露角色名，正太统一以类型名呈现。
     item_text = title if kind == 'loli' else f'{title}{role.name}'
     if kind == 'shota':
         item_text = title
@@ -199,6 +247,7 @@ async def _send_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
 
 async def _accept_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
     title = _daily_item_title(kind)
+    # 待确认键以接受方为末段，故此处用接受者自身的键来查找。
     target_user_id = _user_key(ev)
     pending = _get_pending_gift(ev, target_user_id, kind)
     if pending is None:
@@ -208,8 +257,12 @@ async def _accept_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
         )
 
     giver_id = str(pending['giver_id'])
+    # 先摘除待确认项再执行校验：本函数后续可能因状态失效而提前返回，
+    # 若不先摘除，该请求会一直留到超时，用户在窗口内无法重新发起。
     _clear_pending_gift(ev, target_user_id, kind)
 
+    # 与发起阶段同源的功能判定。此处不重新校验功能开关是否变化，
+    # 因为开关变更属于运维操作，已登记的请求按登记时状态继续处理更符合预期。
     if kind == 'husband' and not _husband_available():
         return
     if not _gift_enabled(kind):
@@ -224,11 +277,16 @@ async def _accept_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
 
     response: str | None = None
     confirmed_giver_record: WifeRecord | None = None
+    # 关键临界区：从读取上下文到写回记录全程持锁。发起与确认之间相隔最长 60 秒，
+    # 期间赠送方的对象可能被抢、被转送，接受方也可能自己抽到了对象；只有在这里
+    # 基于最新状态重新判定，才能避免把已不属于赠送方的记录写进接受方账下。
     async with _daily_context_lock(ev):
         context = await _load_daily_context(ev)
         bucket = _daily_bucket_name(kind)
         giver_data = context[bucket].get(giver_id)
 
+        # 逐项重新校验，并把失败原因写入 response 后统一在锁外发送，
+        # 避免持锁做网络往返而阻塞同上下文的其它命令。
         state = _wife_state(giver_data)
         if state == 'lost_stolen':
             response = f'对方的{title}已经被抢走了，赠送已失效~'
@@ -239,17 +297,25 @@ async def _accept_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
         elif _is_secondhand_wife(giver_data):
             response = f'这个{title}是抢来或别人送的，不能再送出去，赠送已失效~'
         elif _has_active_wife(context[bucket].get(target_user_id)):
+            # 接受方在等待期间自己抽到了对象，此时接受会造成一人持有两份记录。
             response = f'你现在已经有{title}了，不需要接受赠送啦~'
         else:
+            # 从上下文中的字典重建记录：上下文里存的是原始 dict，
+            # 而写回需要不可变的记录对象（其构造会再次校验字段完整性）。
             confirmed_giver_record = _record_from_dict(giver_data)
             if confirmed_giver_record is None:
                 response = f'对方现在已经没有{title}可以送给你了，赠送已失效~'
             else:
+                # gifted_from 标记接受方的记录来源，供后续判断其为「别人送的」，
+                # 从而禁止再次转送。
                 receiver_record = _record_to_dict(confirmed_giver_record, ev, target_user_id)
                 receiver_record['gifted_from'] = giver_id
                 giver_update = context[bucket].get(giver_id)
+                # 两次写入在同一批提交中落盘：接受方新增记录与赠送方标记转出必须原子生效，
+                # 若分两次提交，中间失败会造成记录被复制而非转移。
                 updates = [(bucket, target_user_id, receiver_record)]
                 if isinstance(giver_update, dict):
+                    # 复制后再改，避免就地修改上下文缓存中的字典。
                     giver_update = dict(giver_update)
                     giver_update['gifted_to'] = target_user_id
                     giver_update['gifted_to_name'] = _user_display_name(ev, target_user_id)
@@ -258,10 +324,12 @@ async def _accept_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
 
     if response is not None:
         return await _safe_send(bot, response)
+    # 双重保护：临界区内未确认记录时不可继续发送成功结果。
     if confirmed_giver_record is None:
         return await _safe_send(bot, f'对方现在已经没有{title}可以送给你了，赠送已失效~')
 
     role = confirmed_giver_record.to_role()
+    # 结果图归属赠送方（其记录被转出），因此用户键传 giver_id 而非接受方。
     await _send_gift_result_image(
         bot,
         role,
@@ -276,10 +344,13 @@ async def _accept_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
 async def _reject_gift_daily(bot: Bot, ev: Event, kind: str = 'wife') -> None:
     title = _daily_item_title(kind)
     target_user_id = _user_key(ev)
+    # 无待确认项时不报错也不提示「已拒绝」：避免用户通过反复发送拒绝命令
+    # 探测他人是否正在向自己发起赠送。
     if _get_pending_gift(ev, target_user_id, kind) is None:
         return await _safe_send(bot, f'没有待确认的送{title}请求。')
     _clear_pending_gift(ev, target_user_id, kind)
     await _safe_send(bot, f'已拒绝对方的送{title}请求。')
+
 
 
 async def _send_gift_wife(bot: Bot, ev: Event) -> None:

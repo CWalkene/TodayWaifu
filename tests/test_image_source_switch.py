@@ -1,7 +1,16 @@
 """图片来源开关按功能拆分：各功能可独立选择本地图片或远程图库。
 
-改造前 `_image_source()` 无参、只作用于鸣潮老婆/老公，战双与萝莉把「优先图库」
-写死在代码里、异环则写死本地，用户无法按功能取舍。这里锁定改造后的契约。
+改造前 `_image_source()` 无参、只读取每日老婆的单一开关，战双、萝莉与异环的远程路径都不受
+它约束：战双与萝莉始终优先请求远程接口，异环则无条件回退第三方 CDN。用户无法按功能取舍，
+也无法让某项功能完全离线。dd71d75 引入按功能名寻址的开关表，本文件锁定其契约。
+
+两条约束值得单独说明。其一，映射必须按功能名而非 role_mode：loli 的 role_mode 是 wife，
+若以 role_mode 索引，萝莉会错误地读取老婆的开关，两项功能不再独立。其二，新开关的默认值
+必须逐项等于改造前的实际行为（原先走远程的默认 gallery），否则升级后未改动配置的用户会看到
+表现突变。
+
+此外还要防一类不报错的退化：`_image_source` 直接以 kind 索引默认值表，两张表一旦不同构
+（缺键）即抛 KeyError，因此除逐项默认值外另设同构性断言。
 """
 
 import ast
@@ -35,7 +44,9 @@ EXPECTED_DEFAULTS = {
 
 
 def _module_mapping(path: Path, name: str) -> dict[str, str]:
-    """读取模块级的字典字面量常量，收窄成 dict[str, str] 再交给断言比较。"""
+    """在不导入被测模块的前提下读取其模块级字典常量，供断言与源码真值直接比对。"""
+    # 以 AST 取字面量而非导入模块：constants.py 依赖包内相对导入，导入会连带拉起
+    # gsuid_core；literal_eval 同时排除了表达式求值，确保读到的是静态常量本身。
     tree = ast.parse(path.read_text(encoding='utf-8'))
     for node in tree.body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
@@ -48,6 +59,7 @@ def _module_mapping(path: Path, name: str) -> dict[str, str]:
 
 def _config_exprs() -> dict[str, str]:
     """把 CONFIG_DEFAULT 的每个配置项还原成源码表达式，便于断言选项与默认值。"""
+    # 保留源码表达式而非求值结果，才能同时断言 options 列表与默认值这两部分内容。
     tree = ast.parse((ROOT / 'config_default.py').read_text(encoding='utf-8-sig'))
     for node in tree.body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
@@ -66,6 +78,8 @@ def _extract_function(
     extra_globals: dict[str, object],
 ) -> Callable[..., object]:
     """按名字抽出单个函数（同步或协程均可），配合注入的 fake 依赖做行为验证。"""
+    # 抽出而非导入同样是为了绕开 gsuid_core 依赖；注入的 fake 让网络与磁盘可被观测，
+    # 从而断言「是否真的发起了远程请求」这类行为，而非仅核对源码文本。
     tree = ast.parse(path.read_text(encoding='utf-8'))
     wanted = [
         node for node in tree.body if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name
@@ -98,12 +112,14 @@ class ImageSourceMappingTests(unittest.TestCase):
         self.assertEqual(defaults, EXPECTED_DEFAULTS)
 
     def test_both_source_tables_cover_the_same_kinds(self) -> None:
-        """两张表必须同构：_image_source 用 kind 直接索引默认值表，缺键会 KeyError。"""
+        """两张表必须同构：`_image_source` 用 kind 直接索引默认值表，缺键会 KeyError。"""
         keys = _module_mapping(PACKAGE / 'constants.py', '_IMAGE_SOURCE_CONFIG_KEYS')
         defaults = _module_mapping(PACKAGE / 'constants.py', '_IMAGE_SOURCE_DEFAULTS')
         self.assertEqual(set(keys), set(defaults))
 
     def test_switches_are_editable_in_the_console_with_both_options(self) -> None:
+        # 仅存在于代码中的默认值不算开关：配置项必须在 CONFIG_DEFAULT 中出现，且同时
+        # 提供 local 与 gallery 两个选项，否则用户只能接受默认行为。
         exprs = _config_exprs()
         for key, default in (
             ('DailyWifeImageSource', 'local'),
@@ -124,6 +140,8 @@ class SourceSwitchWiringTests(unittest.TestCase):
         self.assertIn('_image_source(role_mode)', gallery)
 
     def test_pgr_checks_its_own_switch_before_going_remote(self) -> None:
+        # local 判断必须早于远程地址拼接：顺序颠倒时即使配置为 local，仍会先构造并
+        # 访问远程地址，开关形同虚设。
         gallery = (PACKAGE / 'gallery.py').read_text(encoding='utf-8')
         body = gallery[gallery.index('async def _load_pgr_wife_candidates(') : gallery.index('def _gallery_api_url(')]
         self.assertIn("_image_source('pgr') == 'local'", body)
@@ -134,6 +152,9 @@ class SourceSwitchWiringTests(unittest.TestCase):
         )
 
     def test_nte_switch_controls_the_official_cdn_fallback(self) -> None:
+        # 异环的开关同时控制两处：候选加载侧是否允许官方 CDN 兜底，以及本地扫描侧
+        # 是否在无图时继续走远程。二者共用 allow_remote_fallback 参数，任一处未接线
+        # 都会使 local 模式下仍然访问官方 CDN。
         gallery = (PACKAGE / 'gallery.py').read_text(encoding='utf-8')
         nte_body = gallery[
             gallery.index('async def _load_nte_candidates(') : gallery.index('async def _load_candidates(')
@@ -157,10 +178,14 @@ class SourceSwitchWiringTests(unittest.TestCase):
         self.assertIn('await _load_pgr_wife_candidates()', body)
 
     def test_loli_switch_gates_the_remote_api_url(self) -> None:
+        # local 模式下把接口地址置为空串，使下游的远程请求分支自然失效；这比在
+        # loli.py 内部另加分支更不易漏改。
         loli = (PACKAGE / 'loli.py').read_text(encoding='utf-8')
         self.assertIn("_loli_api_url() if _image_source('loli') == 'gallery' else ''", loli)
 
     def test_prefetch_only_preheats_switches_that_use_the_gallery(self) -> None:
+        # 预热只对走图库的功能有意义：对 local 模式预热会凭空下载图片，既浪费带宽，
+        # 也把本应完全离线的模式拉回网络依赖。
         prefetch = (PACKAGE / 'prefetch.py').read_text(encoding='utf-8')
         body = prefetch[prefetch.index('async def _prefetch_once(') : prefetch.index('def _prefetch_modes(')]
         self.assertIn("if _image_source(mode) == 'gallery'", body)
@@ -171,6 +196,8 @@ class PgrBehaviourTests(unittest.TestCase):
     """行为级验证：local 完全不碰网络，gallery 优先远程、失败才回退本地。"""
 
     def _load_pgr(self, source: str, recorder: list[str]) -> Callable[..., object]:
+        # 远程抓取一律抛错，使 gallery 模式必然走到回退分支；recorder 据此还原实际
+        # 调用次序，用于证明 local 模式未发起任何远程请求（而非仅「最终结果相同」）。
         def fake_fetch(url: str) -> dict[str, object]:
             recorder.append(url)
             raise RuntimeError('远程图库不可用')
@@ -226,6 +253,8 @@ class NteBehaviourTests(unittest.TestCase):
             self.images = images
 
     def _load_nte(self) -> Callable[..., object]:
+        # 角色表提供「角色A」，但不注入任何本地图片根，从而稳定复现「有角色但无图」，
+        # 这正是 local 模式下必须给出明确原因的边界输入。
         return _extract_function(
             PACKAGE / 'roles.py',
             '_load_nte_local_candidates',
@@ -247,7 +276,9 @@ class NteBehaviourTests(unittest.TestCase):
         )
 
     def test_local_mode_without_any_local_image_reports_a_reason(self) -> None:
-        # _load_nte_local_candidates 是同步函数，直接调用即可
+        # _load_nte_local_candidates 是同步函数，直接调用即可。
+        # 本地无图时必须返回 (None, 原因) 而非空候选：((), None) 表示「确实没有角色」，
+        # 上层据此只能给出笼统提示，真实原因是「本地图片缺失、可切图库」。
         result = self._load_nte()(False)
         self.assertIsInstance(result, tuple)
         candidates, error = result
@@ -255,6 +286,8 @@ class NteBehaviourTests(unittest.TestCase):
         self.assertIn('本地没有找到可用的异环角色图片', error or '')
 
     def test_gallery_mode_falls_back_to_the_official_cdn(self) -> None:
+        # 开启远程兜底时，图片地址由 role_id 拼接官方 CDN 基址；断言到具体 URL 而非
+        # 仅断言非空，可发现拼接格式（分隔符、ID 取值）的漂移。
         result = self._load_nte()(True)
         self.assertIsInstance(result, tuple)
         candidates, error = result

@@ -2,6 +2,9 @@
 
 本模块把拆分后的各子模块按原名重新导出（见 `__all__`），业务模块按需显式
 `from .shared import (...)` 取用，不再使用星号导入。
+
+保留再导出层是为了让模块拆分为纯内部重构：外部调用方与测试仍可沿用原有的
+`TodayWaifu.shared.X` 路径，避免拆分本身成为破坏性变更。
 """
 from __future__ import annotations
 
@@ -361,13 +364,15 @@ def _can_specify_wife(ev: Event) -> bool:
 async def _migrate_legacy_wife_data() -> int:
     """把旧版 daily_wife_data.json 导入数据库，导入成功后改名为 .migrated.bak 备份。
 
-    幂等：旧文件改名后即消失，重复启动不会重复导入；
-    即使备份失败残留旧文件，导入本身按 (day, context) 先删后插也不会产生重复行。
-    只迁移最近几天的数据，更老的直接丢弃（见 models.LEGACY_MIGRATION_KEEP_DAYS）。
+    幂等性由「改名」与「先删后插」双重保证：旧文件改名后即消失，重复启动不会重复导入；
+    即使备份阶段失败而残留旧文件，导入本身按 (day, context) 先删后插也不会产生重复行。
+    只迁移最近数日的数据，更早的直接丢弃（见 models.LEGACY_MIGRATION_KEEP_DAYS）：
+    历史冷数据既不会被查询，却会永久占用表空间并拖慢热路径扫描。
     """
     path = _wife_data_path()
     if not path.is_file():
-        # 兼容更旧版本：插件目录下的数据文件先搬到 data 目录再迁移
+        # 兼顾更早版本：数据文件原位于插件目录，需先搬到 data 目录再迁移，
+        # 否则升级后既读不到旧数据，也会因插件目录被覆盖而永久丢失。
         legacy = BASE_DIR / 'daily_wife_data.json'
         if legacy.is_file():
             try:
@@ -397,7 +402,11 @@ async def _migrate_legacy_wife_data() -> int:
 
 @on_core_start_before(priority=-70)
 async def _migrate_daily_wife_data_on_startup() -> None:
-    """插件启动钩子：在核心建表（priority=-90）之后执行旧 JSON 迁移。"""
+    """插件启动钩子：在核心建表（priority=-90）之后执行旧 JSON 迁移。
+
+    priority 必须晚于核心建表：迁移依赖每日记录表与其唯一索引已存在，
+    否则写入会因缺表或缺冲突目标而失败。
+    """
     try:
         await _migrate_legacy_wife_data()
     except (OSError, SQLAlchemyError) as exc:
@@ -421,7 +430,8 @@ def _prune_pending_state() -> None:
             created_at = 0
         if now - created_at > CUSTOM_ROLE_DELETE_CONFIRM_SECONDS:
             CUSTOM_ROLE_DELETE_PENDING.pop(key, None)
-    # gift / normal_wife 的待处理状态与缓存由各自模块持有，仅在已加载时清理。
+    # gift / normal_wife 的待处理状态与缓存由各自模块持有；此处仅在其已导入时清理，
+    # 避免为了一次维护而强制加载尚未使用的模块。
     if f'{__package__}.gift' in sys.modules:
         from . import gift as gift_module
 
@@ -433,7 +443,11 @@ def _prune_pending_state() -> None:
 
 
 async def _prune_old_daily_records() -> None:
-    """删除保留期之外的每日记录，避免表随天数无限增长。"""
+    """删除保留期之外的每日记录，避免表随天数无限增长。
+
+    表行数按「群 × 用户 × 桶 × 天数」增长，不设保留期会使行数随运行天数线性膨胀，
+    进而拖慢按天查询与状态页聚合。
+    """
     retention_days = _record_retention_days()
     if retention_days <= 0:
         return
@@ -491,7 +505,8 @@ async def _cache_maintenance_once() -> None:
         30 * 24 * 60 * 60,
         CACHE_MAINTENANCE_FILE_LIMIT,
     )
-    # 兜底：按天过期之外再加一层总容量上限，避免 URL 会变时把磁盘吃满
+    # 按天过期之外再叠加一层总容量上限：图库 URL 带签名时会不断产生新的缓存键，
+    # 仅靠 TTL 无法阻止磁盘被逐步占满，故需要按总字节数淘汰最旧文件。
     evicted = await run_blocking(
         enforce_cache_size_budget,
         gallery_cache_root,
@@ -545,7 +560,10 @@ async def _stop_cache_maintenance_on_shutdown() -> None:
 
 @on_core_shutdown
 async def _stop_blocking_executor_on_shutdown() -> None:
-    """关停前把待提交的每日记录写入落库，再释放线程池。"""
+    """关停前把待提交的每日记录写入落库，再释放线程池。
+
+    次序不可颠倒：线程池一旦释放，尚未提交的写入会连同其阻塞任务一并丢失。
+    """
     try:
         await flush_pending_writes()
     except SQLAlchemyError as exc:

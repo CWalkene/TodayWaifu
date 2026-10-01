@@ -89,7 +89,8 @@ def _parse_pgr_gallery_candidates(payload: GalleryPayload) -> tuple[RoleCandidat
 
 async def _load_pgr_wife_candidates() -> tuple[RoleCandidate, ...]:
     if _image_source('pgr') == 'local':
-        # local 模式完全不碰网络：本地没图就返回空，由调用方提示用户放图
+        # local 模式必须完全不触碰网络：即使远程图库可用也不得访问，本地无图时返回空，
+        # 由调用方向用户提示上传图片
         return await run_blocking(_load_pgr_local_candidates)
 
     api_url = _pgr_gallery_api_url()
@@ -136,6 +137,9 @@ def _http_get(url: str, *, timeout: int = 15, max_bytes: int = MAX_GALLERY_RESPO
                 raise OSError(f'远程响应过大（超过 {max_bytes} 字节）。')
         chunks: list[bytes] = []
         total = 0
+        # 逐块读取而非一次性 read()：Content-Length 可能被省略或低报，只有按累计字节数判断
+        # 才能在越界时立即中断，而不必先把整个响应读入内存。单次读取量刻意多取 1 字节，
+        # 使累计值一旦超过上限即可被察觉，避免上限恰好被读满时误判为未超限。
         while chunk := resp.read(min(64 * 1024, max_bytes - total + 1)):
             total += len(chunk)
             if total > max_bytes:
@@ -144,7 +148,9 @@ def _http_get(url: str, *, timeout: int = 15, max_bytes: int = MAX_GALLERY_RESPO
         return b''.join(chunks)
 
 
-# 按主机熔断：图库整体挂掉时不再让每个用户都打满重试链
+# 按主机熔断：图库整体不可用时，若仍由每个请求各自发起完整重试链，会把已经过载的
+# 上游与线程池一并压垮（重试风暴）。连续失败达到阈值后直接快速失败一段时间，
+# 使上游负载立即归零并留出恢复窗口，插件同时降级到本地图库。
 _HTTP_BREAKER = CircuitBreaker(
     failure_threshold=CIRCUIT_FAILURE_THRESHOLD,
     cooldown_seconds=CIRCUIT_COOLDOWN_SECONDS,
@@ -156,13 +162,21 @@ def _circuit_key(url: str) -> str:
 
 
 def gallery_circuit_state() -> tuple[bool, float]:
-    """返回图库主机的 (是否熔断, 距离冷却结束秒数)，供可观测性使用。"""
+    """返回图库主机的 (是否熔断, 距离冷却结束秒数)，供可观测性使用。
+
+    查询必须走断路器的只读接口：`is_open` 不触发半开转移，若改用 `allow()`，仅采集指标
+    这一动作就会提前消费掉探测机会，使冷却期实际失效。
+    """
     key = _circuit_key(_gallery_api_url())
     return _HTTP_BREAKER.is_open(key), _HTTP_BREAKER.retry_after(key)
 
 
 def _retry_delay(attempt: int) -> float:
-    """指数退避 + 抖动，避免所有失败请求在同一时刻重试形成同步脉冲。"""
+    """返回第 `attempt` 次重试前的等待秒数：指数退避叠加抖动。
+
+    退避上限用于约束单次等待，避免失败次数增多后等待时间无界增长；抖动的意义在于打散
+    重试时刻——否则同一批失败请求会在同一瞬间一起重试，形成同步脉冲，反而加剧上游压力。
+    """
     base = RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
     return min(base, RETRY_MAX_DELAY_SECONDS) + random.uniform(0, RETRY_JITTER_SECONDS)
 
@@ -176,12 +190,16 @@ def _http_get_with_retry(
 ) -> bytes:
     """请求远程资源，失败或超时时按指数退避重试 `retries` 次。
 
-    401/403/429 属于认证、授权或限流类错误：重试无意义（限流要等窗口过去），
-    直接抛出，**也不喂给熔断器** —— 它们是客户端侧条件，不是上游故障。
-    把限流当成上游故障会让图库被误熔断，之后所有请求都快速失败并回退本地，
-    用户看到的是「图库挂了」而不是「我们请求太快了」。
+    重试次数必须保持极小（当前配置为 1）。每次重试都是对上游的完整重放，重试次数即是
+    故障期间请求量的放大倍数；重试次数偏大不仅无助于恢复，还会在零点高峰把上游与线程池
+    一起推到过载，因此宁可尽早失败并降级到本地图库。
 
-    连续失败达到阈值后熔断一段时间，期间直接快速失败，不再打网络。
+    401/403/429 属于认证、授权与限流类错误：重试无法改变结果（限流须等待窗口过去），
+    故直接抛出，且**不记入熔断器** —— 这三类是客户端侧条件，不代表上游故障。若把限流
+    计入熔断失败，一次突发限流就会令图库被误熔断，此后全部请求快速失败并回退本地，
+    用户看到的现象从「请求过快」变成「图库已挂」，排查方向随之偏离。
+
+    其余连续失败达到阈值后熔断一段时间，冷却期内直接快速失败，不再产生网络请求。
     """
     key = _circuit_key(url)
     if not _HTTP_BREAKER.allow(key):
@@ -239,11 +257,11 @@ def _fetch_gallery_payload_sync() -> GalleryPayload:
 
 
 def _fetch_gallery_payload_from_url_sync(url: str) -> GalleryPayload:
-    """按给定地址拉取图库列表（战双 / 测试图库走这里）。
+    """按给定地址拉取图库列表（战双与测试图库走此入口）。
 
-    与 `_fetch_gallery_payload_sync` 一样，把认证/限流类错误转成可操作的中文提示：
-    这里原先会让 HTTPError 直接冒泡，调用方只能看到 `HTTP Error 403: Forbidden`，
-    既不知道是令牌问题还是 IP 被封，也无从下手。
+    与 `_fetch_gallery_payload_sync` 一致，须把认证与限流类错误映射为可操作的中文提示。
+    该入口原先任由 HTTPError 冒泡，调用方只能得到 `HTTP Error 403: Forbidden`，既无法
+    判断是令牌问题还是 IP 被封，也没有可执行的排查方向。
     """
     try:
         body = _http_get_with_retry(url, timeout=GALLERY_HTTP_TIMEOUT_SECONDS)
@@ -281,10 +299,13 @@ def _parse_role_candidates(
 
         role_ids_data = item.get('role_ids') or []
         role_ids = tuple(str(role_id).strip() for role_id in role_ids_data if str(role_id).strip())
+        # 以本地对照表为准做准入：图库包含跨模式的全部角色，缺少这一步会把不在本模式
+        # 对照表中的角色混入候选，导致抽取结果与命名规则不一致
         allowed_role_ids = tuple(role_id for role_id in role_ids if role_id in role_map)
         if not allowed_role_ids:
             continue
 
+        # 名称取对照表而非图库返回值：展示名须与用户在配置中维护的名称一致
         name = role_map[allowed_role_ids[0]]
         if not name or _is_excluded_role(name):
             continue
@@ -295,6 +316,7 @@ def _parse_role_candidates(
                 url = str(image_item.get('url') or '').strip()
             else:
                 url = str(image_item or '').strip()
+            # 仅接受 http(s) 图片地址：本地路径由磁盘扫描负责，相对路径也无法在下载侧解析
             if url.startswith(('http://', 'https://')):
                 images.append(url)
         if images:
@@ -307,9 +329,10 @@ def _parse_role_candidates(
 def _auth_error_reason(exc: HTTPError, *, what: str) -> str:
     """把图库的 401/403/429 转成可操作的中文提示。
 
-    图库侧可能因为多种原因拒绝：令牌缺失/错误/被注销、IP 被临时封禁、
-    请求过于频繁。这些都返回 403/429，单看状态码无法区分，所以顺带读一下
-    响应体里图库给出的 `error` 字段，让用户知道到底该改配置还是稍后重试。
+    图库拒绝请求的原因不止一种：令牌缺失、错误或被注销，IP 被临时封禁，请求过于频繁。
+    这些情形都可能落在 403/429 上，仅凭状态码无法区分，因此需要读取响应体中的 `error`
+    字段，使用户能判断应当修改配置还是稍后重试。响应体不可读或格式异常时退化为按状态码
+    给出的通用提示：错误映射本身不得成为失败点。
     """
     code = getattr(exc, 'code', 0)
     detail = ''
@@ -352,7 +375,18 @@ def _download_image_sync(url: str) -> bytes:
 
 
 async def _download_image(url: str) -> bytes:
-    """下载图库图片；按 URL 哈希落盘缓存，并合并相同 URL 的并发下载。"""
+    """下载图库图片；按 URL 归一化后的哈希落盘缓存，并合并相同 URL 的并发下载。
+
+    归一化由 `file_cache` 负责：图库为每张图附加的短期签名随周期轮换，若以原始 URL 为
+    缓存键，签名一变即视为新资源，既使预热成果全部失效，也会在磁盘上重复保存同一张图。
+
+    并发合并以 URL 为键共享同一个 Task，使同一张图只下载一次；合并的前提是下载任务
+    独立于任何等待方，因此单个等待者超时或取消不会中断共享任务，其余等待者仍能取到
+    结果。信号量在任务内部获取，故合并后的请求只占用一个下载名额。
+
+    任务句柄的清理限定为「自身已完成且仍是表中当前项」：若期间已被其它协程替换，
+    清除操作会误删新任务，导致后续请求无法合并。
+    """
     cache_root = _gallery_image_cache_root()
     cached = await run_blocking(read_url_cache, cache_root, url)
     if cached is not None:
@@ -363,6 +397,8 @@ async def _download_image(url: str) -> bytes:
     if task is None:
         async def download() -> bytes:
             async with _IMAGE_DOWNLOAD_SEMAPHORE:
+                # 进入信号量后复查磁盘缓存：等待名额期间同一张图可能已由其它任务写盘，
+                # 此处命中可省去一次重复下载
                 second_cached = await run_blocking(read_url_cache, cache_root, url)
                 if second_cached is not None:
                     return second_cached
@@ -383,7 +419,12 @@ async def _fallback_to_local_candidates(
     custom_candidates: tuple[RoleCandidate, ...],
     fallback_error: str,
 ) -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
-    """图库接口失败后的兜底：优先回退本地图片目录，其次使用本地上传候选。"""
+    """图库接口失败后的兜底：优先回退本地图片目录，其次使用本地上传候选。
+
+    回退顺序按数据完整度排列：本地图片目录覆盖角色更全，上传候选仅为用户补传的少量角色。
+    两者皆空时原样返回图库侧错误原因，使调用方能把真实故障告知用户，而不是笼统报「没有
+    可用角色」。
+    """
     local_candidates, local_error = await run_blocking(_load_local_candidates, role_mode)
     if local_candidates:
         logger.warning(f'{LOG_PREFIX} 图库接口不可用，已回退本地图片目录。')
@@ -426,6 +467,9 @@ async def _load_wuwa_candidates_uncached(mode: str = 'wife') -> tuple[tuple[Role
                 rid not in gallery_role_ids and _normalize_role_name(rname) not in gallery_role_names
                 for rid, rname in role_map.items()
             )
+            # 图库缺图时用本地图片补位：对照表中的角色可能尚未收录于图库，若不做补齐，
+            # 这些角色会从候选集中静默消失，用户侧表现为「某些角色永远抽不到」。
+            # 判据同时比对名称与 ID，避免因命名写法不同而重复补入同一角色。
             if missing_in_gallery:
                 local_candidates, _ = await run_blocking(_load_local_candidates, role_mode)
                 if local_candidates:
@@ -443,8 +487,8 @@ async def _load_wuwa_candidates_uncached(mode: str = 'wife') -> tuple[tuple[Role
         candidates = _merge_role_candidates(candidates, custom_candidates)
     except (RuntimeError, OSError, TimeoutError) as exc:
         logger.warning(f'{LOG_PREFIX} 读取图库接口失败: {exc}')
-        # RuntimeError 携带图库接口的友好原因；I/O 类异常沿用原通用文案，避免把底层
-        # errno 细节直接暴露给用户。
+        # RuntimeError 携带图库接口的友好原因；I/O 类异常沿用通用文案，避免把底层 errno
+        # 细节直接暴露给用户。
         reason = str(exc) if isinstance(exc, RuntimeError) else '读取图库接口失败。'
         candidates, error = await _fallback_to_local_candidates(role_mode, custom_candidates, reason)
         if error or not candidates:
@@ -455,6 +499,7 @@ async def _load_wuwa_candidates_uncached(mode: str = 'wife') -> tuple[tuple[Role
     if not candidates:
         return None, '图库接口里没有找到可用的角色立绘。'
 
+    # 仅缓存成功结果：把「无候选」也写入缓存会使一次瞬时故障在 TTL 内持续生效
     CANDIDATE_CACHE[cache_key] = (now, candidates)
     return candidates, None
 
@@ -471,6 +516,9 @@ async def _load_wuwa_candidates(mode: str = 'wife') -> tuple[tuple[RoleCandidate
         async def load() -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
             async with _CANDIDATE_LOAD_SEMAPHORE:
                 result = await _load_wuwa_candidates_uncached(role_mode)
+                # 代次用于识别失效竞态：失效钩子会递增代次并清空缓存，若加载期间代次已变，
+                # 说明本次结果早于用户的数据变更，写回会把已删除角色重新灌入缓存，
+                # 因此此处须回退为清空而非保留。
                 if generation != state._CANDIDATE_CACHE_GENERATION:
                     CANDIDATE_CACHE.pop(cache_key, None)
                 return result
@@ -485,7 +533,8 @@ async def _load_wuwa_candidates(mode: str = 'wife') -> tuple[tuple[RoleCandidate
 
 async def _load_nte_candidates() -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
     source = _image_source('nte')
-    # 用 nte: 前缀而不是 local:nte，避免与 _load_local_candidates 的候选缓存互相覆盖
+    # 键使用 nte: 前缀而非 local:nte：后者与 `_load_local_candidates` 使用的缓存键相同，
+    # 两个加载器写入的数据结构并不一致，共用键会相互覆盖
     cache_key = f'nte:{source}'
     cached = CANDIDATE_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
@@ -495,10 +544,13 @@ async def _load_nte_candidates() -> tuple[tuple[RoleCandidate, ...] | None, str 
         generation = state._CANDIDATE_CACHE_GENERATION
         async def load() -> tuple[tuple[RoleCandidate, ...] | None, str | None]:
             async with _CANDIDATE_LOAD_SEMAPHORE:
+                # 是否允许远程兜底由取图来源决定：gallery 模式下本地缺图可回退官方 CDN，
+                # local 模式必须保持纯本地
                 candidates, error = await run_blocking(_load_nte_local_candidates, source == 'gallery')
                 if error or not candidates:
                     return None, error
                 CANDIDATE_CACHE[cache_key] = (time.time(), candidates)
+                # 同 `_load_wuwa_candidates`：代次变化说明结果早于失效动作，必须丢弃
                 if generation != state._CANDIDATE_CACHE_GENERATION:
                     CANDIDATE_CACHE.pop(cache_key, None)
                 return candidates, None
@@ -522,7 +574,8 @@ async def _load_candidates(mode: str = 'wife') -> tuple[tuple[RoleCandidate, ...
     if role_mode == 'nte':
         return await _load_nte_candidates()
     if role_mode == 'pgr':
-        # 战双有自己的加载器；此前落到鸣潮分支必然报「找不到对照表」，预热一直空转
+        # 战双必须走专属加载器：此前该模式落入鸣潮分支，因缺少对应 ID 对照表而必然报错，
+        # 零点预热在此模式下完全空转
         pgr_candidates = await _load_pgr_wife_candidates()
         if not pgr_candidates:
             return None, '战双老婆图库里还没有可用图片。'

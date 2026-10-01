@@ -1,4 +1,8 @@
-"""TodayWaifu/models.py 数据库层测试。
+"""TodayWaifu/models.py 数据库层的落盘契约测试。
+
+该模块取代旧的 daily_wife_data.json 单文件读写：整份 JSON 的读-改-写随群数与天数增长
+产生写放大，且并发写入会相互覆盖，零点高峰因此卡死（46fd929）。此处锁定三件事：写入后
+读回的值必须等价、事务失败必须整体回滚、旧 JSON 迁移必须幂等且只保留最近数日。
 
 需要 gsuid_core 环境（sqlmodel/aiosqlite），用核心 venv 运行：
     D:/122/bot/xiaoyu/botkj/gsuid_core/.venv/Scripts/python.exe tests/test_models_db.py
@@ -26,6 +30,9 @@ MODULE_PATH = ROOT / "TodayWaifu" / "models.py"
 def _load_models():
     import importlib.util
 
+    # models.py 被设计为不依赖 TodayWaifu 内其它模块（禁运行时相对导入），因此可按文件路径
+    # 独立加载；以模块名登记进 sys.modules 是 dataclass 装饰期查询 cls.__module__ 的前提，
+    # 不登记时该查询返回 None 并直接抛 AttributeError。
     spec = importlib.util.spec_from_file_location("todaywaifu_models", MODULE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load models module")
@@ -33,6 +40,8 @@ def _load_models():
     spec.loader.exec_module(module)
     return module
 
+# 迁移夹具故意含三天数据，且中间日带 rob_attempts 这类非 dict 标记、最新日带 stolen_from
+# 这类可选字段：迁移需完整保留布尔标记与嵌套键，仅比较「导入条数 > 0」无法发现字段丢失。
 LEGACY_DATA = {
     "days": {
         "2026-08-10": {
@@ -67,6 +76,8 @@ class DailyWifeRecordDbTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.models = _load_models()
+        # 每个测试类使用独立临时库：用例验证的是事务与 upsert 语义，共用库会让前序用例
+        # 残留的行参与后续断言。
         cls._tmp = tempfile.TemporaryDirectory()
         db_file = Path(cls._tmp.name) / "test.db"
         engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}")
@@ -77,17 +88,21 @@ class DailyWifeRecordDbTests(unittest.TestCase):
                 await conn.run_sync(SQLModel.metadata.create_all)
 
         asyncio.run(_init())
-        # 把 with_session 用的全局 session 工厂指向临时库
+        # 把 with_session 用的全局 session 工厂指向临时库：被测方法由装饰器自行取会话，
+        # 不接管该全局引用就只能测到真实数据库路径。
         cls._old_maker = base_models.async_maker
         base_models.async_maker = async_sessionmaker(engine)
 
     @classmethod
     def tearDownClass(cls) -> None:
+        # 必须还原全局工厂：漏还原会把临时库泄漏给同进程内的后续测试类。
         base_models.async_maker = cls._old_maker
         asyncio.run(cls._engine.dispose())  # Windows 下先释放连接再删文件
         cls._tmp.cleanup()
 
     def test_save_then_load_round_trip(self) -> None:
+        # 锁定写入-读回的等价性，尤其要覆盖非 dict 的布尔标记：rob_attempts 以 record_type
+        # 标记行存储，序列化路径若把 True 退化为字典或字符串，抢老婆的去重语义随即失效。
         models = self.models
 
         async def run() -> None:
@@ -109,6 +124,8 @@ class DailyWifeRecordDbTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_save_context_overwrite_is_idempotent(self) -> None:
+        # 同一上下文重复保存只允许留下最新值且不产生重复行：upsert 冲突列漏配或误用插入，
+        # 都会在同一主键上堆积旧值，使「今日老婆」在重试后读出过期记录。
         models = self.models
 
         async def run() -> None:
@@ -127,6 +144,9 @@ class DailyWifeRecordDbTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_apply_rows_rolls_back_delete_when_upsert_fails(self) -> None:
+        # 删除与 upsert 必须同处一个事务：a982e77 之前两者分次提交，upsert 失败时删除已生效，
+        # 用户的参与记录被清空而新记录未写入，等同数据丢失。此处注入 upsert 异常，
+        # 断言既有行仍在且新行未落库。
         models = self.models
 
         async def run() -> None:
@@ -158,6 +178,7 @@ class DailyWifeRecordDbTests(unittest.TestCase):
                         [seed_key],
                     )
             finally:
+                # 无论断言是否通过都还原被替换的类方法，避免污染同类中的其它用例。
                 models.DailyWifeRecord._upsert_rows = original_upsert
 
             self.assertEqual(
@@ -173,6 +194,8 @@ class DailyWifeRecordDbTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_import_legacy_keeps_only_recent_two_days(self) -> None:
+        # 迁移只保留最近 keep_days 天：旧 JSON 可能积压多年，全量导入会放大表体积并拖慢
+        # 当日读取路径。同时锁定可选字段（stolen_from）与布尔标记在迁移中不丢失。
         models = self.models
 
         async def run() -> int:
@@ -194,7 +217,8 @@ class DailyWifeRecordDbTests(unittest.TestCase):
 
         asyncio.run(check())
 
-        # 幂等：重复导入行数不变
+        # 幂等：重复导入行数不变。迁移在启动时触发，升级重启可能多次执行，
+        # 非幂等会累积重复行；实现以「先按 (day, context) 删除再插入」保证该性质。
         asyncio.run(run())
 
         async def count() -> int:

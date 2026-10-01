@@ -1,4 +1,12 @@
-"""TodayWaifu - daily module."""
+"""TodayWaifu - daily module.
+
+承载「今日老婆」各模式的抽取主流程：状态判定、补偿重抽、每日唯一性约束与结果渲染。
+
+抽取必须在「持锁复核」与「随机挑选」之间保持既有次序：随机挑选依赖候选列表，
+而候选加载可能阻塞于网络或磁盘，若整个过程中持锁，会让同群其它用户的抽取串行等待。
+因此本模块统一采用「锁外准备、锁内复核落库」的模式，热点路径上任何网络/磁盘等待
+都不得进入临界区。
+"""
 from __future__ import annotations
 
 from .shared import (
@@ -85,7 +93,8 @@ def _build_text(role: RoleCandidate, mode: str = 'wife', user_id: str = '') -> s
             lines.append(quote)
     if bool(_cfg('DailyWifeShowRoleId')) and mode != 'normal':
         lines.append(f'角色ID：{"/".join(role.role_ids)}')
-    # 部分平台没有数字 QQ 号，群友只能复制这串 ID 来抢，故单独留开关
+    # 部分平台不提供可 @ 的数字账号，群友只能复制该串 ID 完成「抢老婆」，
+    # 故与角色 ID 分开设置开关，便于按平台单独关闭。
     if user_id and bool(_cfg('DailyWifeShowUserId')) and mode != 'normal':
         lines.append(f'你的ID：{user_id}')
     return '\n'.join(lines)
@@ -129,7 +138,8 @@ async def _ensure_daily_wife_record(
 
     chosen: WifeRecord | None = None
     if specified_role is not None:
-        # 主人指定：跳过群友老婆与随机池，直接锁定指定角色
+        # 主人指定需绕过群友老婆与随机池：指定语义要求结果确定，
+        # 与随机抽取互斥。
         chosen = _pick_role_record((specified_role,), random)
     elif mode == 'wife' and not _cfg_bool('DailyWifeNormalEnabled', False):
         chosen = await _roll_group_member_wife(ev, key)
@@ -171,7 +181,8 @@ async def _ensure_daily_wife_record(
 async def _wife_list_items(ev: Event, mode: str = 'wife') -> tuple[str, list[tuple[int, str, str]]]:
     bucket = 'husbands' if mode == 'husband' else 'wives'
     title = '老公' if mode == 'husband' else '老婆'
-    # 群成员查询可能访问数据库/适配器，必须移出每日记录锁，避免阻塞其它群的抽取。
+    # 群成员查询可能访问数据库或平台适配器而产生阻塞，必须置于每日记录锁之外：
+    # 若在临界区内等待，同群其它用户的抽取会被一并阻塞。
     group_display_names = await _load_group_display_names(ev)
     async with _daily_context_lock(ev):
         context = await _load_daily_context(ev)
@@ -209,7 +220,8 @@ async def _wife_list_items(ev: Event, mode: str = 'wife') -> tuple[str, list[tup
             except (TypeError, ValueError):
                 order = 0
             state = _wife_state(raw_record)
-            # 被抢但有补偿老婆的，留给 safe_wives 循环显示补偿名字，不显示"被抢走了~"
+            # 被抢但存在补偿老婆时，展示交由下方 safe_wives 分支输出补偿角色名，
+            # 此处跳过以免同一用户出现两条互相矛盾的记录行。
             if state == 'lost_stolen' and isinstance(context.get('safe_wives', {}).get(user_id), dict):
                 continue
             if state == 'lost_stolen':
@@ -325,7 +337,8 @@ async def _send_daily_wife(
     is_debug_active = _cfg_bool('DailyWifeDebugMode', False) and is_master
     can_specify_role = _can_specify_wife(ev)
     specified_name = _normalize_role_name(specified_name)
-    # 仅 Debug 模式保持临时预览不落库；主人指定同样写入每日记录，0 点随记录重置
+    # Debug 模式下仅做临时预览、不落库；主人指定同样写入每日记录，
+    # 以便与普通抽取共享同一套每日唯一性与跨日重置语义。
     is_transient_draw = is_debug_active
 
     specified_role: RoleCandidate | None = None
@@ -371,7 +384,8 @@ async def _send_daily_wife(
         bucket = _daily_bucket_name(mode)
         current_record = context[bucket].get(user_key)
 
-        # 离手即结算：老婆被抢走后可补偿重抽一次（safe_wife），送出/离婚仍锁死；老公离手后也锁死。
+        # 离手即结算：被抢走后允许补偿重抽一次（safe_wife），
+        # 而送出与离婚均不可挽回，故仍锁死至次日；老公离手同样锁死。
         state = _wife_state(current_record)
         if state == 'owned' and specified_role is not None and isinstance(current_record, dict):
             existing = _record_from_dict(current_record)
@@ -381,7 +395,8 @@ async def _send_daily_wife(
                     f'你今天已经有{existing.name}了，不要贪心！',
                 )
         if state == 'lost_stolen' and mode == 'wife':
-            # 已有补偿老婆的直接展示
+            # 已有补偿老婆时直接复用：补偿抽取同样受每日唯一性约束，
+            # 重复抽取会产生多条记录并使「今天已抽过」的判定失效。
             safe_record = context['safe_wives'].get(user_key)
             if isinstance(safe_record, dict):
                 safe_wife = _record_from_dict(safe_record)
@@ -389,7 +404,7 @@ async def _send_daily_wife(
                     logger.debug(f'{LOG_PREFIX} 用户 {ev.user_id} 展示已有的补偿老婆: {safe_wife.name}')
                     return await _send_record_image(bot, safe_wife, mode, ev.user_id, ev.group_id is not None)
 
-            # 未抽过补偿老婆：抽一个，写入 safe_wives；主人指定时直接用指定角色
+            # 首次补偿抽取；主人指定时直接采用指定角色，不再走随机池。
             wife_name = current_record.get('name', '老婆')
             stolen_by_name = current_record.get('stolen_by_name') or current_record.get('stolen_by')
             if specified_role is not None:
@@ -407,7 +422,8 @@ async def _send_daily_wife(
                 logger.warning(f'{LOG_PREFIX} 补偿抽取没有可用图片')
                 return await _safe_send(bot, f'没有找到可用的{title}角色。')
 
-            # 候选加载期间可能有其它协程写入，持锁重新加载并复核状态后再落库
+            # 候选加载在锁外完成，期间可能有其它协程（抢老婆、赠送、离婚）改写记录，
+            # 故必须重新取锁、重新加载快照并复核状态后再落库，否则会用过期状态覆盖新状态。
             reused_safe_wife: WifeRecord | None = None
             state_changed = False
             async with _daily_context_lock(ev):
@@ -428,7 +444,8 @@ async def _send_daily_wife(
                         )
 
             if state_changed:
-                # 状态已变化（离婚/赠送等），重走标准流程给出对应提示
+                # 状态在锁外准备阶段已被改写为离手以外的状态（离婚、赠送等），
+                # 补偿路径的前提不再成立，改走标准流程以给出与当前状态相符的提示。
                 return await _send_daily_wife(bot, ev, mode, specified_name='')
             if reused_safe_wife is not None:
                 logger.debug(f'{LOG_PREFIX} 用户 {ev.user_id} 展示已有的补偿老婆: {reused_safe_wife.name}')

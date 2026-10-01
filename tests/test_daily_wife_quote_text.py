@@ -1,8 +1,12 @@
-"""战双/异环老婆的文本必须与鸣潮共用同一套构造，且带上角色台词。
+"""三种老婆文本必须共用同一套构造函数，且都带上角色台词与署名。
 
-背景：pgr.py 曾经自己拼模板，只输出「你今天的战双老婆是XXX。」，既没有
-get_role_quote 也没有署名行，导致战双老婆永远看不到台词；异环虽然走 daily 的
-公共路径，但没有测试锁住，同样可能被改坏。
+背景：pgr.py 曾自行拼接模板，只输出「你今天的战双老婆是XXX。」，既不调用
+get_role_quote 也无署名行，导致战双老婆永远看不到台词；鸣潮与异环走 daily.py 的
+_build_text 因此不受影响（1edf2c4）。异环虽然一直走公共路径，但当时没有任何测试
+锁定该行为，同类的旁路改写仍可能复发，故本文件同时锁住三者的文本来源与开关语义。
+
+台词内容本身来自 role_quotes.json，属于数据资产而非代码契约，这里的断言只检查
+「台词是否被带上」这一结构性事实，不校验具体句子。
 """
 
 import ast
@@ -21,6 +25,8 @@ BUNDLED_QUOTES = ROOT / 'role_quotes.json'
 QUOTES_FILE = BUNDLED_QUOTES if BUNDLED_QUOTES.is_file() else None
 
 
+# 以下三个假对象替代生产数据类型：被测函数只读取 name / role_ids / images 与两个模板
+# 字段，用真实类型会连带引入图库、配置与事件依赖，使断言从「文本构造」偏移到运行时装配。
 @dataclass
 class _FakeRole:
     name: str
@@ -44,6 +50,8 @@ class _FakeRecord:
 
 
 def _load_role_quotes_module() -> dict[str, Any]:
+    # 台词模块依赖 resource_paths 定位打包资源，测试环境无该上下文，故剔除相对导入并由
+    # 注入的 role_quotes_path 直接指向仓库内的内置台词库。
     tree = ast.parse(QUOTES_MODULE.read_text(encoding='utf-8-sig'))
     tree.body = [
         node
@@ -62,6 +70,7 @@ def _extract_function(path: Path, name: str, globals_dict: dict[str, Any]) -> An
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
     )
+    # 抽取出的片段脱离原模块，需补回 future import，注解才保持惰性求值。
     future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
     module = ast.Module(body=[future, function], type_ignores=[])
     ast.fix_missing_locations(module)
@@ -69,6 +78,8 @@ def _extract_function(path: Path, name: str, globals_dict: dict[str, Any]) -> An
     return globals_dict[name]
 
 
+# 模板按模式的真实默认值给出：模板串本身不是被测对象，但它是「文本里出现角色名」的
+# 前提，缺失会让断言因无关原因失败。
 TEMPLATES = {
     'wife': ('DailyWifeTextTemplate', '你今天的老婆是{name}'),
     'nte': ('DailyWifeNteTextTemplate', '你今天的异环老婆是{name}。'),
@@ -97,6 +108,8 @@ class DailyWifeQuoteTextTests(unittest.TestCase):
         self.build_text = _extract_function(DAILY_PATH, '_build_text', dict(self.quote_on))
 
     def _pgr_result_text(self, record: _FakeRecord, user_id: str = ''):  # noqa: ANN202
+        # 每次重新抽取并绑定当次 globals：pgr 的结果函数通过模块级名称调用 _build_text，
+        # 复用同一份 globals 字典可让测试替换的桩生效。
         globals_dict = dict(self.quote_on)
         globals_dict['WifeRecord'] = _FakeRecord
         globals_dict['_build_text'] = self.build_text
@@ -117,7 +130,10 @@ class DailyWifeQuoteTextTests(unittest.TestCase):
         self.assertIn('——早雾', text)
 
     def test_pgr_text_has_quote(self) -> None:
-        """战双曾漏掉台词：pgr 现在必须复用 _build_text。"""
+        """战双曾漏掉台词：pgr 现在必须复用 _build_text。
+
+        该断言同时覆盖署名行，而署名行的缺失正是 1edf2c4 之前用户可感知的症状。
+        """
         text = self._pgr_result_text(_FakeRecord('露西亚', ('1001',)))
         self.assertIsNotNone(text)
         assert text is not None
@@ -126,13 +142,18 @@ class DailyWifeQuoteTextTests(unittest.TestCase):
         self.assertIn('——露西亚', text)
 
     def test_pgr_reuses_shared_text_builder(self) -> None:
-        """守卫：pgr.py 不得再自己拼模板。"""
+        """守卫：pgr.py 不得再自己拼模板。
+
+        行为断言只覆盖当前实现路径；本项直接检查源码，使「另起一套模板」的写法即使
+        恰好产出相同文本也会被拦下。
+        """
         source = PGR_PATH.read_text(encoding='utf-8')
         self.assertIn('from .daily import _build_text', source)
         body = source[source.index('def _pgr_result_text(') : source.index('async def _send_daily_pgr_wife(')]
         self.assertIn('_build_text(', body)
 
     def test_quote_switch_off_drops_the_quote_line(self) -> None:
+        # 关闭开关后文本中不得残留任何引号，否则说明台词行来自未被开关控制的旁路。
         globals_dict = dict(self.quote_on)
         globals_dict['_cfg_bool'] = lambda key, default=False: False
         build_text = _extract_function(DAILY_PATH, '_build_text', globals_dict)
@@ -141,6 +162,8 @@ class DailyWifeQuoteTextTests(unittest.TestCase):
         self.assertNotIn('「', text)
 
     def test_pgr_text_respects_send_text_switch(self) -> None:
+        # 战双走公共构造函数后仍须独立响应 DailyWifeSendText：若直接返回构造结果，关闭
+        # 文本发送的部署会照常推送文本，与配置语义不符。
         globals_dict = dict(self.quote_on)
         globals_dict['WifeRecord'] = _FakeRecord
         globals_dict['_build_text'] = self.build_text

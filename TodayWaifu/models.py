@@ -1,10 +1,10 @@
 """TodayWaifu 每日记录数据库模型。
 
-替代旧的 data/TodayWaifu/daily_wife_data.json 单文件存储：
-一行 = 某用户（user_id）某天（day）在某群（bot_id+group_id）某个桶（bucket）里的一条记录。
-record 字典整体序列化进 payload 列，name/state/origin 等列用于控制台展示与查询过滤。
+取代旧的 data/TodayWaifu/daily_wife_data.json 单文件存储：整份 JSON 的读-改-写随群数与
+天数增长产生写放大，且并发写入会相互覆盖；按“用户 × 日期 × 群 × 桶”拆成独立行后，单次
+变更只落一行，record 整体序列化进 payload 以兼容旧结构，name/state/origin 冗余供查询过滤。
 
-本模块不依赖 TodayWaifu 内其它模块，可独立加载（测试用 importlib 直接加载）。
+本模块不依赖 TodayWaifu 内其它模块，测试用 importlib 直接加载，故禁止运行时相对导入。
 """
 from __future__ import annotations
 
@@ -30,31 +30,31 @@ from gsuid_core.utils.database.base_models import (
 )
 
 if TYPE_CHECKING:
-    # 仅供类型检查器解析：本模块会被测试用 importlib 独立加载，不能有运行时相对导入。
+    # 仅供类型检查器解析：本模块被测试以 importlib 独立加载，运行时相对导入会直接失败。
     from .payloads import WifeData, DailyContext, RoleRecordValue
 
 LOG_PREFIX = '[鸣潮今日老婆]'
 
-# 迁移旧 JSON 时只保留最近几天的数据
+# 迁移时只保留最近数日：旧 JSON 可能积压多年，全量导入会无谓放大表体积与清理成本。
 LEGACY_MIGRATION_KEEP_DAYS = 2
 
-# 非 dict 的桶记录（如 rob_attempts 里的 True 标记）在表里的 record_type
+# 非 dict 值（如 rob_attempts 的 True 标记）没有可拆分的业务列，以此 record_type 标识。
 MARKER_RECORD_TYPE = 'marker'
 
 
 class _ExcludedColumns(Protocol):
-    """SQLite upsert 冲突时本次待写入的列集合（statement.excluded）。"""
+    """SQLAlchemy 未公开 excluded 的类型，故以协议声明其按列名的下标访问。"""
 
     def __getitem__(self, key: str) -> ColumnElement[object]: ...
 
 
 def _conflict_update_columns(statement: Insert) -> dict[str, ColumnElement[object]]:
-    """冲突时用 excluded（本次待写入的值）覆盖的业务列；列名固定，逐列按名取。"""
+    """构造冲突时的覆盖列集合；主键与业务键不参与覆盖，避免行被改写为另一业务键。"""
     excluded: _ExcludedColumns = statement.excluded
     return {column: excluded[column] for column in _CONFLICT_UPDATE_COLUMNS}
 
 
-# upsert 冲突时需要覆盖的业务列（与 _row_from_value 写入的列保持一致）
+# upsert 冲突时需要覆盖的业务列：须与 _row_from_value 产出的列一致，漏列会使旧值残留。
 _CONFLICT_UPDATE_COLUMNS = (
     'name', 'display_name', 'image', 'record_type', 'state',
     'origin', 'updated_at', 'payload',
@@ -62,7 +62,7 @@ _CONFLICT_UPDATE_COLUMNS = (
 
 
 def _record_state(raw: object) -> str:
-    """与 shared._wife_state 口径一致：owned/lost_stolen/lost_gifted/divorced。"""
+    """派生 state 列；取值口径须与 shared._wife_state 一致，否则控制台过滤会错判。"""
     if not isinstance(raw, dict):
         return 'owned'
     if raw.get('divorced'):
@@ -75,7 +75,7 @@ def _record_state(raw: object) -> str:
 
 
 def _record_origin(raw: object) -> str:
-    """与 shared._wife_origin 口径一致：self/robbed/gifted/safe。"""
+    """派生 origin 列；取值口径须与 shared._wife_origin 一致，否则统计聚合会与业务口径偏离。"""
     if not isinstance(raw, dict):
         return 'self'
     if raw.get('stolen_from'):
@@ -88,13 +88,13 @@ def _record_origin(raw: object) -> str:
 
 
 def split_context_key(context_key: str) -> tuple[str, str]:
-    """把 shared._context_key 拼出的 'bot_id:group_id' 拆回两段。"""
+    """拆分 shared._context_key 拼接的上下文键；群号缺失时归为 direct，避免落库出现空群号。"""
     bot_id, _, group_id = str(context_key).partition(':')
     return bot_id, group_id or 'direct'
 
 
 class DailyWifeRecord(BaseModel, table=True):
-    """今日老婆每日记录表。"""
+    """今日老婆每日记录表；唯一约束保证同一业务键在库内至多一行，upsert 才有可依的冲突目标。"""
 
     __table_args__ = (
         UniqueConstraint('day', 'bot_id', 'group_id', 'bucket', 'user_id'),
@@ -114,7 +114,7 @@ class DailyWifeRecord(BaseModel, table=True):
     payload: str = Field(default='{}', title='完整记录JSON')
 
     def to_record_value(self) -> RoleRecordValue | bool | None:
-        """还原为旧 JSON 结构里的记录值（dict 或 True 标记）。"""
+        """还原为旧 JSON 结构的记录值，使上层读取路径与单文件存储时期保持同构。"""
         try:
             value = json.loads(self.payload)
         except (TypeError, ValueError):
@@ -123,7 +123,7 @@ class DailyWifeRecord(BaseModel, table=True):
             return value
         if self.record_type == MARKER_RECORD_TYPE:
             return True
-        # payload 损坏时的兜底重建，保证 name/image 等关键字段不丢
+        # payload 损坏时的兜底重建：宁可丢 role_ids，也要保住 name/image，否则展示层会整条空白。
         return {
             'name': self.name,
             'role_ids': [],
@@ -163,7 +163,7 @@ class DailyWifeRecord(BaseModel, table=True):
                 updated_at=updated_at,
                 payload=json.dumps(value, ensure_ascii=False),
             )
-        # 非 dict 值（如 rob_attempts 的 True 标记）只保留 payload
+        # 非 dict 值没有可拆分的字段，仅落 payload，避免为标记类记录虚构业务列。
         return cls(
             bot_id=bot_id,
             user_id=str(user_key),
@@ -183,7 +183,7 @@ class DailyWifeRecord(BaseModel, table=True):
         bot_id: str,
         group_id: str,
     ) -> DailyContext:
-        """只加载一个 bot/group 上下文，供每日热路径使用。"""
+        """只加载单个 bot/group 上下文，避免每日热路径一次取回全天所有群的行。"""
         result = await session.execute(
             select(cls)
             .where(cls.day == day)
@@ -207,7 +207,7 @@ class DailyWifeRecord(BaseModel, table=True):
         user_key: str,
         value: RoleRecordValue | bool | None,
     ) -> None:
-        """定向写入一条记录，不影响同一上下文的其它用户或桶。"""
+        """以业务键 upsert 单条记录，使不同用户或桶的并发写入互不覆盖。"""
         row = cls._row_from_value(day, bot_id, group_id, bucket, user_key, value)
         values = {
             'name': row.name,
@@ -245,7 +245,7 @@ class DailyWifeRecord(BaseModel, table=True):
         records: list[tuple[str, str, RoleRecordValue | bool | None]],
         deletes: list[tuple[str, str]] | None = None,
     ) -> None:
-        """在一个事务中定向更新或删除少量业务记录。"""
+        """在同一事务内先删后写少量记录；删除必须先于插入，否则会连带清掉刚写入的行。"""
         if deletes:
             for bucket, user_key in deletes:
                 await session.execute(
@@ -296,7 +296,7 @@ class DailyWifeRecord(BaseModel, table=True):
         session: AsyncSession,
         rows: list[tuple[str, str, str, str, str, RoleRecordValue | bool | None]],
     ) -> None:
-        """在调用方提供的 session 中执行多上下文 upsert，不负责提交事务。"""
+        """在调用方事务中执行多上下文 upsert；不提交也不回滚，原子边界由调用方决定。"""
         values = []
         for day, bot_id, group_id, bucket, user_key, value in rows:
             row = cls._row_from_value(day, bot_id, group_id, bucket, str(user_key), value)
@@ -335,7 +335,7 @@ class DailyWifeRecord(BaseModel, table=True):
         session: AsyncSession,
         rows: list[tuple[str, str, str, str, str]],
     ) -> None:
-        """在调用方提供的 session 中执行删除，不负责提交事务。"""
+        """在调用方事务中执行删除；不提交也不回滚，以便与同批 upsert 共用原子边界。"""
         for day, bot_id, group_id, bucket, user_key in rows:
             await session.execute(
                 delete(cls)
@@ -353,7 +353,7 @@ class DailyWifeRecord(BaseModel, table=True):
         session: AsyncSession,
         rows: list[tuple[str, str, str, str, str, RoleRecordValue | bool | None]],
     ) -> None:
-        """把多个上下文的记录合并成一次独立事务的多值 upsert。"""
+        """以一次多值 upsert 落盘多个上下文，避免按上下文逐次提交带来的额外事务开销。"""
         await cls._upsert_rows(session, rows)
 
     @classmethod
@@ -363,7 +363,7 @@ class DailyWifeRecord(BaseModel, table=True):
         session: AsyncSession,
         rows: list[tuple[str, str, str, str, str]],
     ) -> None:
-        """批量删除多个上下文的记录，使用一次独立事务。"""
+        """以单次事务删除多个上下文的记录，保证批内全部生效或全部回滚。"""
         await cls._delete_rows(session, rows)
 
     @classmethod
@@ -374,7 +374,7 @@ class DailyWifeRecord(BaseModel, table=True):
         rows: list[tuple[str, str, str, str, str, RoleRecordValue | bool | None]],
         deletes: list[tuple[str, str, str, str, str]],
     ) -> None:
-        """原子应用一批删除和 upsert，共用同一个事务。"""
+        """在同一事务内应用删除与 upsert，避免部分成功使上下文停留在中间态。"""
         await cls._delete_rows(session, deletes)
         await cls._upsert_rows(session, rows)
 
@@ -388,7 +388,7 @@ class DailyWifeRecord(BaseModel, table=True):
         group_id: str,
         context: DailyContext,
     ) -> None:
-        """在一个写事务中 upsert 一个上下文的全部记录。"""
+        """以事务整体覆盖单个上下文快照，并同步清理快照中已消失的业务键。"""
         values = []
         desired_keys: set[tuple[str, str]] = set()
         for bucket, records in context.items():
@@ -418,8 +418,8 @@ class DailyWifeRecord(BaseModel, table=True):
                     }
                 )
 
-        # 快照也可能删除记录（离婚、赠送、补偿覆盖），先清理数据库中
-        # 不再存在的业务键，避免仅 upsert 导致旧记录重新 hydrate 出现。
+        # 快照也可能减少记录（离婚、赠送、补偿覆盖）；仅做 upsert 会让库中残留行在下次
+        # hydrate 时重新出现，故先按业务键删除快照中已不存在的行，再写回当前快照。
         existing = await session.execute(
             select(cls.bucket, cls.user_id)
             .where(cls.day == day)
@@ -462,7 +462,7 @@ class DailyWifeRecord(BaseModel, table=True):
         bucket: str,
         user_key: str,
     ) -> None:
-        """定向删除一条记录。"""
+        """按业务键删除单条记录；键不存在时静默成功，调用方无需预先探测。"""
         await session.execute(
             delete(cls)
             .where(cls.day == day)
@@ -477,8 +477,8 @@ class DailyWifeRecord(BaseModel, table=True):
     async def delete_before(cls, session: AsyncSession, cutoff_day: str) -> int:
         """删除 `cutoff_day` 之前的每日记录，返回删除行数。
 
-        `day` 是 ISO 日期字符串（`YYYY-MM-DD`），字典序与时间序一致，可以直接比较。
-        表行数 = 群 × 用户 × 桶 × 天数，不清理会随天数无限增长。
+        `day` 为 ISO 日期字符串（`YYYY-MM-DD`），字典序与时间序一致，可直接比较；
+        表行数按“群 × 用户 × 桶 × 天数”增长，缺少清理会无限膨胀并使查询随天数退化。
         """
         result = await session.execute(delete(cls).where(cls.day < cutoff_day))
         return int(result.rowcount or 0)
@@ -494,7 +494,7 @@ class DailyWifeRecord(BaseModel, table=True):
         bucket: str,
         user_key: str,
     ) -> RoleRecordValue | bool | None:
-        """读取一个业务键对应的记录值。"""
+        """读取单个业务键；返回 None 表示该键不存在，而非存在一条空记录。"""
         result = await session.execute(
             select(cls)
             .where(cls.day == day)
@@ -514,12 +514,13 @@ class DailyWifeRecord(BaseModel, table=True):
         day: str,
         bucket_names: tuple[str, ...],
     ) -> dict[str, int]:
-        """一次聚合查询统计指定日期各桶的「原始」记录数量。
+        """以聚合查询统计指定日期各桶的「原始」记录数量。
 
-        原来是把当天所有行的 `payload` 全拉回来逐行 `json.loads` 再判断，
-        是**全天所有群的全表扫描**。这些判断条件其实都已经落到列上了：
-        非空 name + `origin == 'self'`（即没有 stolen_from/gifted_from/safe），
-        所以改成一条带索引的 COUNT 聚合，不再传输与解析任何 payload。
+        旧实现会把当天所有行的 `payload` 拉回逐行 `json.loads` 再判断，等价于对全天
+        所有群做全表扫描。判定条件已冗余到列上（非空 name 且 `origin == 'self'`，
+        即不含 stolen_from/gifted_from/safe），因此改为带索引的 COUNT 聚合：既不
+        传输也不解析 payload。返回的计数口径与旧实现完全一致，调用方无需感知差异，
+        但该口径依赖写入时 state/origin 冗余列与 payload 始终同步。
         """
         if not bucket_names:
             return {}
@@ -543,7 +544,7 @@ class DailyWifeRecord(BaseModel, table=True):
         session: AsyncSession,
         day: str,
     ) -> dict[str, DailyContext]:
-        """加载某一天的全部记录，返回 {context_key: {bucket: {user_key: value}}}。"""
+        """加载整天记录并重建旧 JSON 的嵌套结构，供跨群统计与迁移核对使用。"""
         result = await session.execute(select(cls).where(cls.day == day))
         contexts: dict[str, DailyContext] = {}
         for row in result.scalars().all():
@@ -562,10 +563,11 @@ class DailyWifeRecord(BaseModel, table=True):
         group_id: str,
         context: DailyContext,
     ) -> int:
-        """整体覆写某一天某个群的全部桶记录（先删后插，幂等）。
+        """整体覆写某天某群的全部桶记录（先删后插，重复执行结果一致）。
 
-        调用方必须持有该上下文的 `_daily_context_lock(ev)`（见 daily_store），
-        保证同一 (bot, group) 的读-改-写串行。
+        调用方必须持有该上下文的 `_daily_context_lock(ev)`（见 daily_store）：本方法的
+        删除与插入之间存在窗口，缺少该锁时同一 (bot, group) 的并发读-改-写会相互覆盖。
+        事务若在外部被中断，必须回滚，否则删除已生效而插入丢失，数据将出现整体缺口。
         """
         await session.execute(
             delete(cls)
@@ -593,7 +595,8 @@ class DailyWifeRecord(BaseModel, table=True):
     ) -> int:
         """导入旧 daily_wife_data.json 的内容，只保留最近 keep_days 天。
 
-        每个 (day, context) 都是先删后插，重复执行结果一致（幂等）。
+        每个 (day, context) 均为先删后插，重复执行结果一致（幂等），迁移可安全重试；
+        更早的日期直接丢弃，避免陈年数据挤占表空间并拖慢当日的读取路径。
         """
         days = data.get('days') if isinstance(data, dict) else None
         if not isinstance(days, dict) or not days:
@@ -629,10 +632,10 @@ class DailyWifeRecord(BaseModel, table=True):
         return imported
 
 
-# importlib / GsCore 热加载可能在同一个 SQLModel.metadata 中再次声明本表。
-# SQLModel 对 ``Field(index=True)`` 的重复声明会挂上同名 Index，随后
-# create_all 会尝试执行两次 CREATE INDEX。只保留同一表上的一个等价索引，
-# 不改变现有表名、索引名或业务键。
+# importlib / GsCore 热加载会在同一 SQLModel.metadata 中重复声明本表：SQLModel 对
+# ``Field(index=True)`` 的重复声明会挂上等价但独立的 Index 对象，随后 create_all 会对
+# 同一索引执行两次 CREATE INDEX 而报错。此处按签名去重只保留一个，不改动表名与索引名，
+# 从而无需为既有数据库安排迁移。
 def _deduplicate_table_indexes(table: Table) -> None:
     seen: set[tuple[str | None, tuple[str, ...], bool | None]] = set()
     for index in tuple(table.indexes):
@@ -652,7 +655,7 @@ _deduplicate_table_indexes(DailyWifeRecord.__table__)
 
 @on_core_start_before(priority=-70)
 async def _ensure_daily_wife_record_table() -> None:
-    """插件模型晚于 Core 全局建表时，补建本插件数据表。"""
+    """补建本插件数据表：模型注册晚于 Core 全局建表，缺少该步骤时首启查询会因表不存在而失败。"""
     async with engine.begin() as conn:
         await conn.run_sync(
             DailyWifeRecord.metadata.create_all,
@@ -661,7 +664,7 @@ async def _ensure_daily_wife_record_table() -> None:
         )
 
 
-# 为已有数据库补充业务键唯一约束，供 SQLite upsert 使用。
+# 为既有数据库补建业务键唯一索引：SQLite 的 ON CONFLICT 依赖它作为冲突目标，缺失即退化为重复插入。
 exec_list.append(
     'CREATE UNIQUE INDEX IF NOT EXISTS '
     'ix_daily_wife_record_business_key '

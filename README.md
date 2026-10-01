@@ -21,17 +21,17 @@
 
 ## 丨安装提醒
 
-> 该插件为 [早柚核心 (gsuid_core)](https://github.com/Genshin-bots/gsuid_core) 的扩展插件，必须先部署好 GsCore 框架才能使用。首次安装需重启GsCore 才能完全应用
+> 本插件是 [早柚核心 (gsuid_core)](https://github.com/Genshin-bots/gsuid_core) 的扩展插件，须先完成 GsCore 框架部署方可使用。首次安装后需重启 GsCore 才能完全生效
 
 > [!NOTE]
-> 插件仍处于持续迭代中，使用中有任何问题或建议，欢迎提 [Issue](https://github.com/MimoKit/TodayWaifu/issues) 或加入交流群 **798949533** 讨论。
+> 插件仍在持续迭代。使用中如遇问题或有改进建议，欢迎提交 [Issue](https://github.com/MimoKit/TodayWaifu/issues)，或加入交流群 **798949533** 讨论。
 
 <br/>
 
-## 丨我该如何安装该插件？
+## 丨安装步骤
 
-- 前提：你已经部署好 [gsuid_core](https://github.com/Genshin-bots/gsuid_core)。
-- 将本仓库克隆到 GsCore 插件目录并重启：
+- 前提：已部署 [gsuid_core](https://github.com/Genshin-bots/gsuid_core)。
+- 将本仓库克隆至 GsCore 插件目录，随后重启：
 
 ```bash
 cd gsuid_core/gsuid_core/plugins
@@ -68,15 +68,15 @@ git clone https://github.com/MimoKit/TodayWaifu
 
 ### 图库访问令牌
 
-图库现在对**列表接口与图片本身都要求鉴权**，请务必在控制台填写
+图库的**列表接口与图片本身均要求鉴权**，必须在控制台填写
 `DailyWifeGalleryToken`，否则拉取列表和下载图片都会返回 403。
 
 令牌请进 QQ 交流群 [798949533](https://qm.qq.com/q/pJVt8HNwrg) 获取，
-或前往 <https://twf.xlinxc.cn> 自助申请；留空则不携带令牌。ps：无论选择哪种方式 最终都是要进群的 不进群的不会审核
+或前往 <https://twf.xlinxc.cn> 自助申请；留空则不携带令牌。注意：无论选择哪种方式，最终都须加入该交流群，未加群者不予审核。
 
-插件会在列表与图片两类请求上都自动带上该令牌；当图库因限流、封禁或配额拒绝时，
-会提示对应的处理方式（而不是笼统地让人去检查令牌）。列表返回的图片地址自带短期签名，
-插件下载图片时**同时**带上令牌，因此即使签名已过期（例如读取昨天抽到的老婆记录）
+插件会在列表与图片两类请求上都自动携带该令牌；当图库因限流、封禁或配额拒绝时，
+会提示对应的处理方式，而不会笼统地提示检查令牌。列表返回的图片地址自带短期签名，
+插件下载图片时**同时**携带令牌，因此即使签名已过期（例如读取昨天抽到的老婆记录）
 也能正常取图。
 
 > [!WARNING]

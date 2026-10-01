@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class DailyKindMetadata:
+    # 每个「今日对象」类型（老婆/老公/萝莉/正太/异环/战双/普通）在存储桶名、展示名、
+    # 抽卡模式与配置键上各不相同，但走的是同一套抽卡、抢、送流程。把差异集中成一张表，
+    # 使流程代码只按字段取值，新增类型时补齐一行即可。
     bucket: str
     title: str
     role_mode: str
@@ -19,10 +22,18 @@ class DailyKindMetadata:
     gift_success_default: str
 
 
+# 类型元数据集中定义的原因：这些配置键与默认文案原本散落在抽卡、抢、送、配置引用
+# 守卫测试等多处，任一处漏改都会导致「配置项写了却不生效」或「默认文案与键对不上」。
+# 收敛为单一真值源后，新增类型只需在此登记，其余代码与测试自动覆盖。
+#
+# 字段留空字符串表示该模式不支持对应能力，调用方通过 X_enabled 判断为 False 后直接
+# 放行，不会读到空键。
+#
 # `nte` / `pgr` 的空字符串表示该模式不参与抢/送：`_send_rob_daily` 与
 # `_send_gift_daily` 由 `_rob_enabled` / `_gift_enabled` 返回 False 直接放行，
 # 永远不会读到这些 key。守卫测试（tests/test_config_references.py）会跳过空值。
 DAILY_KIND_METADATA = {
+    # wife 是唯一同时具备完整文案模板、抢与送三组配置的类型，其余类型按需剪裁。
     "wife": DailyKindMetadata(
         bucket="wives",
         title="老婆",
@@ -41,6 +52,7 @@ DAILY_KIND_METADATA = {
         bucket="husbands",
         title="老公",
         role_mode="husband",
+        # 复用老婆的抢成功率键：两者共用同一概率配置，避免出现语义重复的配置项。
         text_template_key="DailyHusbandTextTemplate",
         text_template_default="你今天的老公是{name}",
         rob_enabled_key="DailyHusbandRobEnabled",
@@ -82,7 +94,9 @@ DAILY_KIND_METADATA = {
     "loli": DailyKindMetadata(
         bucket="lolis",
         title="萝莉",
+        # 萝莉复用 wife 的图库模式：其角色来源与老婆相同，仅存储桶与文案不同。
         role_mode="wife",
+        # 萝莉没有独立文案模板，留空使调用方回落到内置的标题式文案。
         text_template_key="",
         text_template_default="",
         rob_enabled_key="DailyLoliRobEnabled",
@@ -127,4 +141,6 @@ DAILY_KIND_METADATA = {
 
 
 def daily_kind_metadata(kind: str) -> DailyKindMetadata:
+    # 未知 kind 回落到 wife 而不是抛 KeyError：调用方多为命令处理器，配置或命令文本
+    # 写错时应退化为「按老婆处理」，避免用户侧直接收到异常。
     return DAILY_KIND_METADATA.get(kind, DAILY_KIND_METADATA["wife"])
