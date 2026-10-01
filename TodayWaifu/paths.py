@@ -291,20 +291,15 @@ def _gallery_image_cache_root() -> Path:
 
 
 def _daily_rng(ev: Event, user_id: str | int | None = None, salt: str = '') -> random.Random:
-    """构造「同一天、同一用户、同一会话」下结果稳定的随机源。
+    """构造抽取的真随机源。
 
-    种子由日期、用户与会话（群聊取群号，私聊统一记为 direct）拼接而成，
-    因此同一天内重复调用必得同一结果，跨日则整体翻新；salt 用于在同一
-    三元组下派生互不干扰的独立序列（如不同分类或不同抽取阶段），
-    缺失时与旧行为保持一致。私聊不区分具体对端，与既有的数据归属口径一致。
+    使用系统熵池构造真随机数生成器（random.SystemRandom），替代基于
+    日期、用户ID与群号拼接固定种子的伪随机逻辑。
+    「当天同一用户拥有固定老婆」的业务语义由落库记录与每日上下文（DailyWifeRecord）
+    负责持久化和拦截，生成新记录时则采用真随机确保结果公平且不可预测。
     """
-    group_key = ev.group_id or 'direct'
-    target_user_id = ev.user_id if user_id is None else user_id
-    seed = f'{date.today().isoformat()}:{target_user_id}:{group_key}'
-    if salt:
-        seed = f'{seed}:{salt}'
-    logger.debug(f'{LOG_PREFIX} 生成随机数种子: {seed}')
-    return random.Random(seed)
+    logger.debug(f'{LOG_PREFIX} 使用系统真随机源抽取')
+    return random.SystemRandom()
 
 
 def _event_rng(ev: Event) -> random.Random:
